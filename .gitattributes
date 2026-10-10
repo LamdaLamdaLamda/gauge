@@ -1,0 +1,13 @@
+# Always store text files with LF line endings, whatever the contributor's OS
+* text=auto eol=lf
+
+# Generated; keep out of the language statistics and collapse it in PR diffs
+Cargo.lock linguist-generated
+
+# Keep repository plumbing out of `git archive` tarballs (release downloads)
+/.github export-ignore
+/.gitattributes export-ignore
+/.gitignore export-ignore
+/.editorconfig export-ignore
+/justfile export-ignore
+/deny.toml export-ignore

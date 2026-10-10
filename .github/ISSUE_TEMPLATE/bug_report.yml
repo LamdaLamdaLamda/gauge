@@ -1,0 +1,53 @@
+name: Bug report
+description: Something doesn't work as documented
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting! For **security problems** please do not use this form — follow SECURITY.md in the repository and report it privately.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened, and what did you expect?
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: The exact client **and** server command lines, or the TUI screen and keys you used.
+      render: shell
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: gauge version
+      description: Output of `gauge --version`
+    validations:
+      required: true
+  - type: input
+    id: platform
+    attributes:
+      label: OS and Rust version
+      description: e.g. "macOS 15, built with rustc 1.88" or "Ubuntu 24.04, installed via cargo install"
+    validations:
+      required: true
+  - type: dropdown
+    id: network
+    attributes:
+      label: Where did you run it?
+      options:
+        - Loopback (same machine)
+        - Local network
+        - Over the internet / VPN
+        - Container or VM
+    validations:
+      required: true
+  - type: textarea
+    id: output
+    attributes:
+      label: Output, screenshot or log
+      description: Error text, a copy of the TUI screen, or the relevant part of `gauge.log`. Remove anything private.
+      render: text

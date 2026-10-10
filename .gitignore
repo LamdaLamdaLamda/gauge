@@ -1,0 +1,12 @@
+# Build output
+/target
+
+# Exports written by the app when run from the project directory
+gauge-export.json
+gauge-history-*.json
+
+# Editors and OS
+/.idea/
+/.vscode/
+*.swp
+.DS_Store
