@@ -65,6 +65,56 @@ pub fn set_congestion(_fd: RawFd, _name: &str) -> io::Result<()> {
     Err(io::Error::new(io::ErrorKind::Unsupported, "only supported on Linux"))
 }
 
+fn buffer_size(fd: RawFd, option: libc::c_int) -> io::Result<usize> {
+    let mut value: libc::c_int = 0;
+    let mut len = size_of::<libc::c_int>() as libc::socklen_t;
+    // SAFETY: `value`/`len` are valid for writes and `len` matches `value`.
+    let rc = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            option,
+            (&mut value as *mut libc::c_int).cast(),
+            &mut len,
+        )
+    };
+    if rc == 0 { Ok(value.max(0) as usize) } else { Err(io::Error::last_os_error()) }
+}
+
+fn set_buffer_size(fd: RawFd, option: libc::c_int, bytes: u32) -> io::Result<()> {
+    let value = bytes.min(i32::MAX as u32) as libc::c_int;
+    // SAFETY: `value` outlives the call and the length matches its type.
+    let rc = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            option,
+            (&value as *const libc::c_int).cast(),
+            size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    if rc == 0 { Ok(()) } else { Err(io::Error::last_os_error()) }
+}
+
+/// The socket's current receive-buffer size, as the kernel reports it.
+#[cfg(test)]
+pub fn recv_buffer(fd: RawFd) -> io::Result<usize> {
+    buffer_size(fd, libc::SO_RCVBUF)
+}
+
+/// Makes the socket's send and receive buffers at least `bytes`. Never
+/// shrinks them: a UDP receiver that is handed a smaller buffer than the OS
+/// default would only lose more packets. The kernel may still clamp the
+/// request (on Linux to `net.core.rmem_max` / `wmem_max`).
+pub fn grow_socket_buffers(fd: RawFd, bytes: u32) -> io::Result<()> {
+    for option in [libc::SO_RCVBUF, libc::SO_SNDBUF] {
+        if buffer_size(fd, option)? < bytes as usize {
+            set_buffer_size(fd, option, bytes)?;
+        }
+    }
+    Ok(())
+}
+
 /// Parses a TOS value as given on the CLI/config: decimal ("184") or hex
 /// ("0xB8").
 pub fn parse_tos(s: &str) -> Option<u8> {
@@ -92,6 +142,23 @@ mod tests {
         let sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         set_tos(sock.as_raw_fd(), 0x88, false).unwrap();
         assert_eq!(get_tos(sock.as_raw_fd(), false).unwrap(), 0x88);
+    }
+
+    #[test]
+    fn grow_socket_buffers_enlarges_but_never_shrinks() {
+        let sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let fd = sock.as_raw_fd();
+        let before = recv_buffer(fd).unwrap();
+
+        grow_socket_buffers(fd, 4096).unwrap(); // far below any OS default
+        assert_eq!(
+            recv_buffer(fd).unwrap(),
+            before,
+            "a smaller request must not shrink the buffer"
+        );
+
+        grow_socket_buffers(fd, 8 * 1024 * 1024).unwrap();
+        assert!(recv_buffer(fd).unwrap() >= before, "a larger request must not shrink it either");
     }
 
     #[test]

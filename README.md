@@ -164,7 +164,7 @@ Options:
   -R, --reverse                  Server sends, client receives
       --bidir                    Both directions at once, over the same connection
   -b, --bandwidth <BANDWIDTH>    UDP target bitrate, e.g. "100M" or "1G" (unthrottled if omitted)
-      --window <WINDOW>          TCP socket buffer / QUIC flow-control window: "256K", "1M" or "auto" [default: 256K]
+      --window <WINDOW>          TCP socket buffer / QUIC flow-control window / UDP socket buffers: "256K", "1M" or "auto" [default: 256K]
       --mtu <MTU>                UDP datagram size: payload = mtu - 28 [default: 9000]
       --buffer <BUFFER>          Size in bytes of each write()/read() call (TCP, QUIC) [default: 131072]
       --omit                     Exclude the first 3 seconds from the average/peak rate
@@ -181,7 +181,7 @@ Options:
   -p, --port <PORT>      Port to listen on [default: 5201]
   -u, --udp              Accept UDP tests instead of TCP
       --quic             Accept QUIC tests instead of TCP (self-signed certificate)
-      --window <WINDOW>  TCP socket buffer / QUIC flow-control window [default: 256K]
+      --window <WINDOW>  TCP socket buffer / QUIC flow-control window / UDP socket buffers [default: 256K]
   -J, --json             Print each event as one JSON line
   -1, --one-off          Stop after the first completed test
 ```
@@ -249,7 +249,7 @@ gauge server --one-off
 |---|:-:|:-:|:-:|---|
 | `--reverse`, `--bidir` | ✅ | ✅ | ✅ | |
 | `--parallel`, `--duration`, `--interval`, `--omit` | ✅ | ✅ | ✅ | |
-| `--window` | ✅ | — | ✅ | TCP: `SO_SNDBUF`/`SO_RCVBUF`. QUIC: flow-control windows |
+| `--window` | ✅ | ✅ | ✅ | TCP: `SO_SNDBUF`/`SO_RCVBUF`. QUIC: flow-control windows. UDP: enlarges the socket buffers (never below the OS default); the kernel may cap it (Linux: `net.core.rmem_max`) |
 | `--buffer` | ✅ | — | ✅ | Size of each `write()`/`read()` call (iperf3's `-l`), not the kernel buffer |
 | `--bandwidth` | — | ✅ | — | Pacing for UDP; TCP and QUIC rely on congestion control |
 | `--mtu` | — | ✅ | — | UDP payload = `mtu − 28`. TCP has no portable socket option to force an MTU |
@@ -323,7 +323,7 @@ gauge is a measurement tool, not a hardened service. Know what it does and does 
 | `connection refused` / handshake times out | No server on that port, wrong protocol (a TCP client cannot reach a `--udp` or `--quic` server), or a firewall dropping UDP. The client and server **must use the same protocol flag**. |
 | `--congestion` fails on macOS | TCP congestion control cannot be chosen per socket on macOS. Use Linux, or `--quic`, whose controller is selectable everywhere. |
 | QUIC is much slower than TCP on loopback | QUIC runs in user space and encrypts every packet; without UDP segmentation offload (e.g. on macOS) one core caps out around 1 Gbit/s. Use a release build and measure on the real path. |
-| UDP shows loss on loopback at very high rates | The receiver's socket buffer overflowed — that is real, measured loss. Lower `--bandwidth`. |
+| High UDP loss without `-b` (most with `--bidir` and several streams) | Unthrottled senders use every CPU cycle; once the machine's cores are saturated the receivers can't keep up and the OS drops the excess. The loss is real, but a property of the test machine, not of the network. Set a target rate with `-b` (e.g. `-b 500M`), which gives 0 % while the receivers keep up. A larger `--window` (UDP socket buffers) only helps with short bursts. |
 | Average looks too low with `--omit` | Omit is ignored for tests not longer than 3 s and the summary says so; use longer tests. |
 | The TUI looks broken or garbled | Use a real terminal with 256-color support and at least ~80×24. Without a real terminal the TUI exits with an error — use `gauge client` / `gauge server` in scripts. |
 
@@ -343,7 +343,7 @@ src/
     protocol.rs  handshake framing (length-prefixed JSON for TCP/QUIC, datagrams for UDP)
     duplex.rs    shared stream read/write loops, interval reporting, per-direction driver
     client.rs    connects and runs a test; TCP and UDP clients
-    server.rs    accepts tests; TCP and UDP servers
+    server.rs    accepts tests; TCP server and UDP server (one socket + task per stream)
     quic.rs      QUIC transport: TLS setup, one connection + stream per test stream
     udp.rs       UDP sender loop, loss/jitter bookkeeping, client receive loop
     tcpinfo.rs   live TCP stats via getsockopt (TCP_INFO / TCP_CONNECTION_INFO)
@@ -369,7 +369,7 @@ just linux                           # the same lints + tests in a Linux contain
 
 CI (`.github/workflows/ci.yml`) checks formatting (`cargo fmt --check`) and the dependency policy (`cargo deny`: licenses, sources, RustSec advisories), then runs clippy with `-D warnings`, the full test suite and a release build on **Linux and macOS**. Dependabot proposes weekly dependency and action updates. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
-**135 tests**, in four layers:
+**139 tests**, in four layers:
 
 | Layer | What it checks |
 |---|---|
@@ -389,6 +389,7 @@ Tests never touch your real config, history or log: those paths are stubbed in u
 - **QUIC is CPU-bound** without UDP segmentation offload; expect far lower numbers than TCP on fast links.
 - **A QUIC server cannot mirror the client's congestion algorithm** (it is fixed before the handshake), and its TOS marking is per socket, so with several clients the latest request wins.
 - **UDP has no flow control:** at high `--bandwidth` the receiver may drop packets; that is what the loss figure shows.
+- **The UDP server relies on `SO_REUSEPORT`** to give each stream its own socket on the listening port (Linux and macOS both route a connected peer's datagrams to its dedicated socket).
 - **No authentication or access control** (see [Security notes](#security-notes)).
 - Measurements were developed and verified on loopback and in a Linux container; behavior across real networks is yours to validate for your path.
 

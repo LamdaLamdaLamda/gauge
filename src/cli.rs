@@ -84,7 +84,8 @@ pub struct ClientArgs {
     bandwidth: Option<String>,
     /// TCP window/buffer size applied to the connecting socket (SO_SNDBUF/
     /// SO_RCVBUF), e.g. "256K", "1M", or "auto" to leave the OS default.
-    /// For QUIC it sets the flow-control windows; UDP has no equivalent.
+    /// For QUIC it sets the flow-control windows; for UDP it enlarges the
+    /// socket send/receive buffers (never below the OS default).
     /// [config default: client.window,
     /// otherwise "256K"]
     #[arg(long)]
@@ -144,7 +145,8 @@ pub struct ServerArgs {
     quic: bool,
     /// TCP window/buffer size applied to the listening socket (SO_SNDBUF/
     /// SO_RCVBUF), e.g. "256K", "1M", or "auto" to leave the OS default.
-    /// For QUIC it sets the flow-control windows; UDP has no equivalent.
+    /// For QUIC it sets the flow-control windows; for UDP it enlarges the
+    /// socket send/receive buffers (never below the OS default).
     /// [config default: server.window,
     /// otherwise "256K"]
     #[arg(long)]
