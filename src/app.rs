@@ -133,7 +133,7 @@ pub struct LiveState {
     rx_bytes_after_omit: u64,
     /// The tuning options this test started with, stored in its History
     /// record. `None` before any test has started.
-    settings: Option<RunSettings>,
+    pub settings: Option<RunSettings>,
     /// Set once a UDP rate search (`-b auto`) has finished.
     rate_search: Option<RateSearchSummary>,
     /// Aggregate throughput samples (elapsed_secs, gbps), gated to stream 0
@@ -1481,7 +1481,7 @@ impl App {
                     self.live.connecting = false;
                     self.live.running = true;
                     self.live.lat = rtt_ms;
-                    push_hist(&mut self.live.lat_hist, rtt_ms.max(0.0) as u64);
+                    push_hist(&mut self.live.lat_hist, (rtt_ms.max(0.0) * 100.0) as u64);
                     self.live.push_log(
                         LogLevel::Ok,
                         format!("connected — {} handshake {rtt_ms:.2}ms", self.live.proto),

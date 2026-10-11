@@ -17,37 +17,39 @@ TCP · UDP · QUIC &nbsp;|&nbsp; TX / RX / bidirectional &nbsp;|&nbsp; real loss
 ┌─────────────────────────────────── gauge — rust network performance tool ────────────────────────────────────┐
 │ ≋ gauge │ Live Test │ Config │ History │ Server Mode │                           ● running  → 127.0.0.1:5201 │
 │┌ ↑ TX Throughput ────── TCP · real ┐┌ ↓ RX Throughput ────── TCP · real ┐┌ Latency ─ connect RTT (one-time) ┐│
-││20.88 Gbit/s                       ││21.20 Gbit/s                       ││0.48 ms                           ││
-││ ──────────────────────────────────││───────────────────────────────────││ ─────────────────────────────────││
-││0                       target 10G ││0                       target 10G ││0                        p99: n/a ││
-││▇▆▆█                               ││▇▅▆█                               ││                                  ││
-││████                               ││████                               ││                                  ││
-││████                               ││████                               ││                                  ││
-││████                               ││████                               ││                                  ││
+││19.48 Gbit/s                       ││19.28 Gbit/s                       ││0.19 ms                           ││
+││0  ───────────────────── target 10G││0 ────────────────────── target 10G││0  ────────────────────── p99: n/a││
+││21.0┤▇█▇▇▇▇▇▅                      ││21.1┤▇▇█▆▇▇▇▅                      ││0.19┤█                            ││
+││    │████████                      ││    │████████                      ││    │█                            ││
+││10.5┤████████                      ││10.6┤████████                      ││0.10┤█                            ││
+││    │████████                      ││    │████████                      ││    │█                           │││
+││   0┼───────┬──────────────────────││   0┼───────┬──────────────────────││   0┼─────────────────────────────││
+││     0s    8s                      ││     0s    8s                      ││     0s                           ││
 │└───────────────────────────────────┘└───────────────────────────────────┘└──────────────────────────────────┘│
 │┌ Per-Stream Breakdown ─────────────────────────────────── 1 stream(s) ┐┌ Test Stats ────────────────────────┐│
 ││Stream  TX Gb/s RX Gb/s RTT ms  Retr  Cwnd KB Loss    Jitter   State  ││Protocol            TCP             ││
-││#1      20.88   21.20   0.48    0     511     0.00%   –        ok     ││Duration            00:00:04        ││
-││                                                                      ││Total TX            10.19 GB        ││
-││                                                                      ││Total RX            10.24 GB        ││
+││#1      19.48   19.28   0.19    0     511     0.00%   –        ok     ││Duration            00:00:08        ││
+││                                                                      ││Total TX            20.64 GB        ││
+││                                                                      ││Total RX            20.70 GB        ││
 ││                                                                      ││Retransmits         0               ││
 ││                                                                      ││Streams             1               ││
 ││                                                                      ││MTU                 9000            ││
 │└──────────────────────────────────────────────────────────────────────┘└────────────────────────────────────┘│
-│┌ Event Log ──────────────────────────────────────────────────────────────────────────────── live · last 60s ┐│
-││18:50:16 [DATA] interval 3-4s  RX 21.20 Gbit/s aggregate (1 stream(s))                                      ││
-││18:50:16 [DATA] interval 3-4s  TX 20.88 Gbit/s aggregate (1 stream(s))                                      ││
-││18:50:15 [DATA] interval 2-3s  RX 20.06 Gbit/s aggregate (1 stream(s))                                      ││
-││18:50:15 [DATA] interval 2-3s  TX 19.97 Gbit/s aggregate (1 stream(s))                                      ││
-││18:50:14 [DATA] interval 1-2s  RX 19.58 Gbit/s aggregate (1 stream(s))                                      ││
-││18:50:14 [DATA] interval 1-2s  TX 19.86 Gbit/s aggregate (1 stream(s))                                      ││
-││18:50:13 [DATA] interval 0-1s  RX 21.04 Gbit/s aggregate (1 stream(s))                                      ││
-││18:50:13 [DATA] interval 0-1s  TX 20.78 Gbit/s aggregate (1 stream(s))                                      ││
-││18:50:12 [OK  ] connected — TCP handshake 0.48ms                                                            ││
+│┌ Event Log ─────────────────────────────────────────────────────────────────────────────── live · last 60s ┐││
+││13:16:45 [DATA] interval 7-8s  RX 19.28 Gbit/s aggregate (1 stream(s))                                      ││
+││13:16:45 [DATA] interval 7-8s  TX 19.48 Gbit/s aggregate (1 stream(s))                                      ││
+││13:16:44 [DATA] interval 5-6s  RX 20.92 Gbit/s aggregate (1 stream(s))                                      ││
+││13:16:43 [DATA] interval 5-6s  TX 20.76 Gbit/s aggregate (1 stream(s))                                      ││
+││13:16:42 [DATA] interval 4-5s  RX 21.03 Gbit/s aggregate (1 stream(s))                                      ││
+││13:16:42 [DATA] interval 4-5s  TX 20.91 Gbit/s aggregate (1 stream(s))                                      ││
+││13:16:41 [DATA] interval 3-4s  RX 20.38 Gbit/s aggregate (1 stream(s))                                      ││
+││13:16:41 [DATA] interval 3-4s  TX 20.36 Gbit/s aggregate (1 stream(s))                                      ││
+││13:16:40 [DATA] interval 2-3s  RX 21.12 Gbit/s aggregate (1 stream(s))                                      ││
+││13:16:40 [DATA] interval 2-3s  TX 20.96 Gbit/s aggregate (1 stream(s))                                      ││
 │└────────────────────────────────────────────────────────────────────────────────────────────────────────────┘│
-│ target 127.0.0.1:5201 │ proto TCP │ streams 1 │ window 256K │ mtu 9000 │                 ● test running — 4s │
+│ target 127.0.0.1:5201 │ proto TCP │ streams 1 │ window 256K │ mtu 9000 │                 ● test running — 7s │
 │ s  Stop   r  Restart   e  Export   1-4  Switch view   q  Quit                                                │
-└──────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+└─────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
 <sub>The Live Test screen during a bidirectional TCP test (rendered from a real run).</sub>
@@ -138,7 +140,7 @@ Run `gauge` without a subcommand. Switch screens with `1`–`4`, quit with `q`.
 
 | Screen | What it does | Keys |
 |---|---|---|
-| **1 Live Test** | Throughput gauges and sparklines for TX/RX, latency or jitter, a per-stream table (RTT, retransmits, congestion window, loss, jitter), test stats and an event log | `s` stop · `r` restart · `e` export JSON |
+| **1 Live Test** | Throughput gauges and sparklines with value and time axes (ticks at the top and middle, `0s … now`) for TX/RX, latency or jitter, a per-stream table (RTT, retransmits, congestion window, loss, jitter), test stats and an event log | `s` stop · `r` restart · `e` export JSON |
 | **2 Config** | Set up a test: target, protocol, duration, streams, direction, window, MTU, buffer, interval, bandwidth, TOS, congestion, omit. A live **CLI preview** shows the equivalent `gauge client` command | `Tab`/`↑↓` next field · `←→`/`Space` change · `Enter` edit a text field · `Esc` cancel · `F5` start · `Ctrl+S` save as defaults |
 | **3 History** | Every completed run with its summary, the options it used and a TX/RX chart | `↑↓` select · `e` export JSON · `d` delete |
 | **4 Server Mode** | Run a server from inside the UI: watch connected clients and their live stats | `Tab`/`↑↓` next field · `F5` start · `Ctrl+S` save as defaults · `s` stop · `k` kill client · `c` clear log |
@@ -376,7 +378,7 @@ just linux                           # the same lints + tests in a Linux contain
 
 CI (`.github/workflows/ci.yml`) checks formatting (`cargo fmt --check`) and the dependency policy (`cargo deny`: licenses, sources, RustSec advisories), then runs clippy with `-D warnings`, the full test suite and a release build on **Linux and macOS**. Dependabot proposes weekly dependency and action updates. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
-**156 tests**, in four layers:
+**168 tests**, in four layers:
 
 | Layer | What it checks |
 |---|---|
