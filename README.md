@@ -163,7 +163,7 @@ Options:
       --quic                     Use QUIC (encrypted, over UDP) instead of TCP
   -R, --reverse                  Server sends, client receives
       --bidir                    Both directions at once, over the same connection
-  -b, --bandwidth <BANDWIDTH>    UDP target bitrate, e.g. "100M" or "1G" (unthrottled if omitted)
+  -b, --bandwidth <BANDWIDTH>    UDP target bitrate, e.g. "100M" or "1G" (unthrottled if omitted); "auto" searches for the highest loss-free rate
       --window <WINDOW>          TCP socket buffer / QUIC flow-control window / UDP socket buffers: "256K", "1M" or "auto" [default: 256K]
       --mtu <MTU>                UDP datagram size: payload = mtu - 28 [default: 9000]
       --buffer <BUFFER>          Size in bytes of each write()/read() call (TCP, QUIC) [default: 131072]
@@ -221,6 +221,10 @@ gauge client --host 10.0.0.5 --reverse
 gauge server --udp                                   # far end
 gauge client --host 10.0.0.5 --udp -b 100M -t 30
 
+# How much UDP can this path carry without loss? Let gauge search for it
+gauge client --host 10.0.0.5 --udp -b auto            # ~20-30 s, prints every probe
+gauge client --host 10.0.0.5 --udp -b auto --bidir    # the weaker direction decides
+
 # Both directions at once over UDP, with a larger datagram size
 gauge client --host 10.0.0.5 --udp --bidir -b 200M --mtu 1500
 
@@ -251,7 +255,7 @@ gauge server --one-off
 | `--parallel`, `--duration`, `--interval`, `--omit` | ✅ | ✅ | ✅ | |
 | `--window` | ✅ | ✅ | ✅ | TCP: `SO_SNDBUF`/`SO_RCVBUF`. QUIC: flow-control windows. UDP: enlarges the socket buffers (never below the OS default); the kernel may cap it (Linux: `net.core.rmem_max`) |
 | `--buffer` | ✅ | — | ✅ | Size of each `write()`/`read()` call (iperf3's `-l`), not the kernel buffer |
-| `--bandwidth` | — | ✅ | — | Pacing for UDP; TCP and QUIC rely on congestion control |
+| `--bandwidth` | — | ✅ | — | Pacing for UDP, or `auto` for the rate search; TCP and QUIC rely on congestion control |
 | `--mtu` | — | ✅ | — | UDP payload = `mtu − 28`. TCP has no portable socket option to force an MTU |
 | `--tos` | ✅ | ✅ | ✅ | `IP_TOS` (IPv6: `IPV6_TCLASS`); also applied to the server's sends |
 | `--congestion` | Linux only | — | ✅ | Refused with an error where it can't be honored — never silently ignored |
@@ -260,7 +264,9 @@ gauge server --one-off
 
 - **Throughput** is bytes moved per interval, as seen by the sender or receiver of that flow. The final average uses exact byte totals, so the live samples (including the short last one) add up to the true total.
 - **`--omit`** excludes the first 3 seconds from the *average and peak* only (TCP slow start); total bytes are never adjusted. A test not longer than 3 s ignores `--omit` and says so.
-- **UDP loss** comes from sequence-number gaps and **jitter** is the RFC 3550 interarrival jitter, both measured by the receiving side: the server for TX tests, the client for RX tests, both for bidirectional ones.
+- **UDP loss** comes from sequence-number gaps and **jitter** is the RFC 3550 interarrival jitter, both measured by the receiving side: the server for TX tests, the client for RX tests, both for bidirectional ones. **Without `-b` the senders go as fast as the machine allows**, so the loss then mostly shows how far that exceeds what the receiver, the CPU or the link can take (on one machine, bidirectional multi-stream tests top out around the machine's loopback/CPU ceiling and report 20–40 % "loss"). Set a target rate for a meaningful figure; gauge prints a note whenever a UDP test starts without one.
+- **UDP rate search (`-b auto`)** runs probes of 2 s. Each probe sends at a target rate (split over the streams) and asks the receiving side what arrived. A probe **passes** at ≤ 0.5 % loss, **fails** above it, and counts as **sender-limited** if this machine couldn't even reach the target (then the machine, not the path, is the limit). The rate doubles from 50 Mbit/s until a probe fails, then the search bisects between the last clean and the first lossy rate, stopping within 5 % (at most 16 probes). The result is the highest rate that passed. For bidirectional tests both directions run at the same rate and the weaker one decides. `-t` is not used.
+- **The receiver's report:** when a UDP stream ends, the receiver sends the sender a tally (packets received/lost, jitter) a few times; that is how a TX-only client learns the loss, and what the rate search relies on.
 - **TCP retransmits and congestion window** are read from the kernel each interval (`TCP_INFO` on Linux, `TCP_CONNECTION_INFO` on macOS). TCP has no direct loss counter, so **loss %** is an estimate: retransmitted ÷ sent segments, with the segment count derived from bytes ÷ MSS.
 - **QUIC retransmits, congestion window and loss** come from the connection statistics of [quinn](https://github.com/quinn-rs/quinn); loss is exact (lost ÷ sent packets).
 - **RTT** is the time of the application-level handshake round trip, measured once at connect.
@@ -345,7 +351,8 @@ src/
     client.rs    connects and runs a test; TCP and UDP clients
     server.rs    accepts tests; TCP server and UDP server (one socket + task per stream)
     quic.rs      QUIC transport: TLS setup, one connection + stream per test stream
-    udp.rs       UDP sender loop, loss/jitter bookkeeping, client receive loop
+    udp.rs       UDP sender loop with smooth pacing, loss/jitter bookkeeping, receive loop, per-stream sockets
+    ratesearch.rs UDP rate search (-b auto): the probe/bisect decision logic + the probe runner
     tcpinfo.rs   live TCP stats via getsockopt (TCP_INFO / TCP_CONNECTION_INFO)
     sockopt.rs   TOS / traffic class and TCP congestion control
     bandwidth.rs window.rs   "100M" / "256K" parsing
@@ -369,7 +376,7 @@ just linux                           # the same lints + tests in a Linux contain
 
 CI (`.github/workflows/ci.yml`) checks formatting (`cargo fmt --check`) and the dependency policy (`cargo deny`: licenses, sources, RustSec advisories), then runs clippy with `-D warnings`, the full test suite and a release build on **Linux and macOS**. Dependabot proposes weekly dependency and action updates. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
-**139 tests**, in four layers:
+**156 tests**, in four layers:
 
 | Layer | What it checks |
 |---|---|
@@ -388,6 +395,7 @@ Tests never touch your real config, history or log: those paths are stubbed in u
 - **No MTU control for TCP** — there is no portable socket option for it.
 - **QUIC is CPU-bound** without UDP segmentation offload; expect far lower numbers than TCP on fast links.
 - **A QUIC server cannot mirror the client's congestion algorithm** (it is fixed before the handshake), and its TOS marking is per socket, so with several clients the latest request wins.
+- **The rate search is a measurement, not a guarantee:** each probe is 2 s, so slow-building problems (buffer bloat, bursts of cross traffic) can slip through; the result is the best loss-free rate *observed*. It needs a `gauge server` of the same version (older ones don't send the receiver report), and a `--one-off` server stops after the first probe.
 - **UDP has no flow control:** at high `--bandwidth` the receiver may drop packets; that is what the loss figure shows.
 - **The UDP server relies on `SO_REUSEPORT`** to give each stream its own socket on the listening port (Linux and macOS both route a connected peer's datagrams to its dedicated socket).
 - **No authentication or access control** (see [Security notes](#security-notes)).

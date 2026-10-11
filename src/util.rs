@@ -59,3 +59,27 @@ pub fn fmt_hms(total_secs: u64) -> String {
     let s = total_secs % 60;
     format!("{h:02}:{m:02}:{s:02}")
 }
+
+/// A bit rate for people: `2.41 Gbit/s`, `480 Mbit/s`, `12 kbit/s`.
+pub fn fmt_rate(bps: u64) -> String {
+    let b = bps as f64;
+    if b >= 1e9 {
+        format!("{:.2} Gbit/s", b / 1e9)
+    } else if b >= 1e6 {
+        format!("{:.0} Mbit/s", b / 1e6)
+    } else {
+        format!("{:.0} kbit/s", b / 1e3)
+    }
+}
+
+#[cfg(test)]
+mod rate_tests {
+    use super::fmt_rate;
+
+    #[test]
+    fn formats_rates_in_the_natural_unit() {
+        assert_eq!(fmt_rate(2_410_000_000), "2.41 Gbit/s");
+        assert_eq!(fmt_rate(480_000_000), "480 Mbit/s");
+        assert_eq!(fmt_rate(12_000), "12 kbit/s");
+    }
+}

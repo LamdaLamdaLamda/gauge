@@ -309,13 +309,17 @@ async fn udp_peer(
     if hs.direction != Direction::Rx {
         let ack = encode_datagram(&HandshakeAck { ok: true, error: None }).unwrap_or_default();
         let max_wait = duration + udp::IDLE_TIMEOUT * 2;
-        let (total, _) =
-            udp::rx_loop(&sock, start, &stop, max_wait, report_every, Some(&ack), |report, q| {
-                send_udp_rx_interval(&tx, session_id, stream_index, report, q)
-            })
-            .await;
-        let avg_gbps = (total as f64 * 8.0) / start.elapsed().as_secs_f64().max(0.001) / 1e9;
+        let cfg =
+            udp::RxConfig { max_wait, report_every, reack: Some(&ack), expect_peer_summary: false };
+        let outcome = udp::rx_loop(&sock, start, &stop, cfg, |report, q| {
+            send_udp_rx_interval(&tx, session_id, stream_index, report, q)
+        })
+        .await;
+        let avg_gbps =
+            (outcome.total_bytes as f64 * 8.0) / start.elapsed().as_secs_f64().max(0.001) / 1e9;
         send_finished(&tx, session_id, stream_index, Flow::Rx, avg_gbps);
+        // Tell the sender what arrived — it has no other way to know.
+        udp::send_summary(&sock, &outcome.own).await;
     }
 
     if let Some(task) = send_task {

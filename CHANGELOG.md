@@ -12,6 +12,12 @@ First public version (`0.1.0`). When it is tagged, rename this heading to
 
 ### Added
 
+- **UDP rate search:** `-b auto` finds the highest rate that arrives without
+  loss — 2 s probes that double until packets are lost, then bisect — in every
+  direction, with a probe table in the CLI, log lines in the TUI and the result
+  stored in the History.
+- **Receiver report for UDP:** the receiving side sends its loss and jitter
+  back when a stream ends, so a TX test now shows the loss the server measured.
 - **Three transports:** TCP, UDP and QUIC (via `quinn`, TLS 1.3 with a
   throw-away self-signed certificate; the client does not verify it).
 - **Directions:** TX, RX (`--reverse`) and bidirectional (`--bidir`) for every
@@ -40,7 +46,7 @@ First public version (`0.1.0`). When it is tagged, rename this heading to
 - **Configuration file** (`config.toml`) with defaults for the CLI and the
   TUI; precedence is command-line flag > config file > built-in default.
   `Ctrl+S` on the Config and Server Mode screens saves the current values.
-- **Tests:** 139 tests — state machine, engine integration over real
+- **Tests:** 156 tests — state machine, engine integration over real
   loopback sockets, rendered screens (ratatui `TestBackend`) and end-to-end
   tests that drive the real binary through a pseudo-terminal.
 - **CI** on Linux and macOS: clippy with `-D warnings`, the full test suite
@@ -54,6 +60,12 @@ First public version (`0.1.0`). When it is tagged, rename this heading to
   MIT `LICENSE`, issue forms and a pull-request template.
 
 ### Changed
+
+- UDP pacing (`-b`) is now smooth: it no longer sleeps per packet (which woke up
+  ~1 ms late and then fired a burst), but waits precisely for fast streams and
+  makes up short stalls, so the average rate stays exact. Bursts were dropped
+  by receivers and made loss figures noisy; with smooth pacing the same paths
+  show no loss up to the machine's limit.
 
 - UDP clients run the sending and receiving halves of a bidirectional or
   reverse test as separate tasks, so a busy sender can no longer starve its own
@@ -70,6 +82,10 @@ First public version (`0.1.0`). When it is tagged, rename this heading to
   about 27 Gbit/s received at the server with loss down from ~88 % to ~6 %, and
   a reverse test from ~4 to ~28 Gbit/s. The server also applies a client's TOS
   request per stream now.
+
+- A UDP test started without a target rate (`-b`) now prints a note (CLI) or
+  logs a warning (TUI) that the loss figure then reflects receiver/path
+  overload rather than network quality.
 
 ### Notes
 

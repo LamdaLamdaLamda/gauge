@@ -82,6 +82,7 @@ fn run(settings: Option<RunSettings>, with_rx: bool) -> HistoryRun {
             Vec::new()
         },
         settings,
+        rate_search: None,
     }
 }
 
@@ -402,4 +403,29 @@ fn listening_server_shows_its_address_and_state() {
     let screen = render(&app, W, H);
     assert_has(&screen, "listening");
     assert_has(&screen, "0.0.0.0:5201");
+}
+
+#[test]
+fn history_shows_a_rate_search_result_and_how_it_ended() {
+    let mut app = app_on(Tab::History);
+    let mut r = run(
+        Some(RunSettings {
+            interval_secs: 1,
+            rate_search: true,
+            omit: false,
+            ..Default::default()
+        }),
+        false,
+    );
+    r.summary = "max loss-free 10.78 Gbit/s · 13 probes".into();
+    r.rate_search = Some(crate::store::RateSearchSummary {
+        best_bps: Some(10_780_000_000),
+        probes: 13,
+        reason: "converged on the limit".into(),
+    });
+    app.history.runs = vec![r];
+    let screen = render(&app, W, H);
+    assert_has(&screen, "max loss-free 10.78 Gbit/s");
+    assert_has(&screen, "rate search");
+    assert_has(&screen, "search: converged on the limit");
 }

@@ -7,9 +7,12 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
 use crate::config::{self, ClientDefaults, GaugeConfig, ServerDefaults};
-use crate::net::{self, ClientParams, Direction, Flow, NetCommand, NetEvent, Proto, ServerParams};
-use crate::store::{HistoryRun, RunSettings};
-use crate::util::{LogLevel, LogLine, now_hms};
+use crate::net::{
+    self, ClientParams, Direction, Flow, NetCommand, NetEvent, ProbeVerdict, Proto, SearchStop,
+    ServerParams,
+};
+use crate::store::{HistoryRun, RateSearchSummary, RunSettings};
+use crate::util::{LogLevel, LogLine, fmt_rate, now_hms};
 
 /// How many interval samples the sparkline history buffers hold — needs to
 /// comfortably exceed the widest realistic terminal width in columns
@@ -131,6 +134,8 @@ pub struct LiveState {
     /// The tuning options this test started with, stored in its History
     /// record. `None` before any test has started.
     settings: Option<RunSettings>,
+    /// Set once a UDP rate search (`-b auto`) has finished.
+    rate_search: Option<RateSearchSummary>,
     /// Aggregate throughput samples (elapsed_secs, gbps), gated to stream 0
     /// like the sparkline/log line — feeds the History screen's chart once
     /// the test completes.
@@ -180,6 +185,7 @@ impl Default for LiveState {
             omit_enabled: false,
             last_sample_secs: [0; 2],
             settings: None,
+            rate_search: None,
             tx_bytes_after_omit: 0,
             rx_bytes_after_omit: 0,
             tx_chart: Vec::new(),
@@ -351,6 +357,18 @@ impl LiveState {
             Direction::Rx => format!("↓{avg_rx_gbps:.2} Gbit/s avg · peak {peak_rx_gbps:.2}"),
             Direction::Tx => format!("↑{avg_tx_gbps:.2} Gbit/s avg · peak {peak_tx_gbps:.2}"),
         };
+        let (summary, peak_tx_gbps, avg_tx_gbps) = match &self.rate_search {
+            // A search's own result replaces the averages over all its probes.
+            Some(found) => {
+                let best = found.best_bps.map_or(0.0, |b| b as f64 / 1e9);
+                let text = match found.best_bps {
+                    Some(b) => format!("max loss-free {} · {} probes", fmt_rate(b), found.probes),
+                    None => format!("no loss-free rate found · {} probes", found.probes),
+                };
+                (text, best, best)
+            }
+            None => (summary, peak_tx_gbps, avg_tx_gbps),
+        };
         HistoryRun {
             target: self.target.clone(),
             tag: format!("{} {dir_label} ×{}", self.proto, self.streams),
@@ -374,6 +392,7 @@ impl LiveState {
             chart: self.tx_chart.clone(),
             chart_rx: self.rx_chart.clone(),
             // Record what was actually applied: a too-short run ignores omit.
+            rate_search: self.rate_search.clone(),
             settings: self.settings.clone().map(|mut s| {
                 s.omit = self.omit_applies(elapsed);
                 s
@@ -394,6 +413,14 @@ fn push_hist(hist: &mut VecDeque<u64>, v: u64) {
         hist.pop_front();
     }
 }
+
+/// Shown when a UDP test starts without a target rate. Unthrottled senders
+/// use every CPU cycle, so the receiver (or a slower link) drops the excess —
+/// the measured loss then says more about overload than about the path.
+pub const UNTHROTTLED_UDP_NOTE: &str = "UDP without a target rate (-b) sends as fast as the machine can, so the loss shown is the receiver/path being overloaded — not the network's quality. Set a rate, e.g. 500M.";
+
+/// Logged when a UDP rate search starts.
+pub const RATE_SEARCH_NOTE: &str = "Searching for the highest loss-free UDP rate: probes of 2 s at rising rates, then narrowing in. Duration is not used.";
 
 pub const PROTOCOLS: [&str; 3] = ["TCP", "UDP", "QUIC"];
 pub const WINDOWS: [&str; 9] = ["64K", "128K", "256K", "512K", "1M", "2M", "4M", "8M", "auto"];
@@ -802,6 +829,18 @@ fn cycle(cur: usize, len: usize, dir: i32) -> usize {
 }
 
 /// Maps a `PROTOCOLS` index to a real transport.
+/// The reason a rate search ended, in words.
+pub fn search_reason_text(reason: SearchStop) -> &'static str {
+    match reason {
+        SearchStop::Converged => "converged on the limit",
+        SearchStop::SenderLimited => "this machine can't send faster; the path may take more",
+        SearchStop::MaxRate => "reached the highest rate tried",
+        SearchStop::NothingFits => "even the lowest rate lost packets",
+        SearchStop::ProbeLimit => "out of probes before settling",
+        SearchStop::Stopped => "stopped",
+    }
+}
+
 fn proto_from_index(idx: usize) -> Option<Proto> {
     match idx {
         0 => Some(Proto::Tcp),
@@ -1365,6 +1404,8 @@ impl App {
                         .flatten(),
                     omit: self.config.omit,
                     interval_secs,
+                    rate_search: proto == Proto::Udp
+                        && net::is_auto_bandwidth(&self.config.bandwidth),
                     tos: Some(TOS_BYTES[self.config.tos]).filter(|t| *t != 0),
                     congestion: (proto != Proto::Udp && self.config.congestion != 0)
                         .then(|| CONGESTION[self.config.congestion].to_string()),
@@ -1372,6 +1413,7 @@ impl App {
             },
             stop.clone(),
         );
+        let rate_search = proto == Proto::Udp && net::is_auto_bandwidth(&self.config.bandwidth);
         let bandwidth_bps =
             if proto == Proto::Udp { net::parse_bps(&self.config.bandwidth) } else { None };
         let buffer_bytes = net::parse_window_bytes(&self.config.buffer);
@@ -1390,8 +1432,14 @@ impl App {
             tos: Some(TOS_BYTES[self.config.tos]).filter(|t| *t != 0),
             congestion: (self.config.congestion != 0)
                 .then(|| CONGESTION[self.config.congestion].to_string()),
+            rate_search,
             session_id: new_session_id(),
         };
+        if rate_search {
+            self.live.push_log(LogLevel::Info, RATE_SEARCH_NOTE.to_string());
+        } else if proto == Proto::Udp && bandwidth_bps.is_none() {
+            self.live.push_log(LogLevel::Warn, UNTHROTTLED_UDP_NOTE.to_string());
+        }
         let _ = self.net_tx.send(NetCommand::StartClient(params, stop));
         true
     }
@@ -1602,6 +1650,77 @@ impl App {
                     }
                 }
             }
+            NetEvent::RateProbe(p) => {
+                let (mark, level) = match p.verdict {
+                    ProbeVerdict::Pass => ("loss-free", LogLevel::Ok),
+                    ProbeVerdict::Fail => ("LOSS", LogLevel::Warn),
+                    ProbeVerdict::SenderLimited => ("sender limit reached", LogLevel::Info),
+                };
+                self.live.push_log(
+                    level,
+                    format!(
+                        "probe {}: target {} → {} delivered, loss {:.2}%, jitter {:.2} ms — {mark}",
+                        p.index,
+                        fmt_rate(p.target_bps),
+                        fmt_rate(p.delivered_bps),
+                        p.loss_pct,
+                        p.jitter_ms
+                    ),
+                );
+            }
+            NetEvent::RateSearchDone { best, probes, reason } => {
+                let why = search_reason_text(reason);
+                let (level, text) = match best {
+                    Some(b) => (
+                        LogLevel::Ok,
+                        format!(
+                            "rate search done — highest loss-free rate: {} ({probes} probes, {why})",
+                            fmt_rate(b.delivered_bps)
+                        ),
+                    ),
+                    None => (
+                        LogLevel::Warn,
+                        format!(
+                            "rate search done — no loss-free rate found ({probes} probes, {why})"
+                        ),
+                    ),
+                };
+                self.live.push_log(level, text);
+                self.live.rate_search = Some(RateSearchSummary {
+                    best_bps: best.map(|b| b.delivered_bps),
+                    probes,
+                    reason: why.to_string(),
+                });
+            }
+            NetEvent::ClientUdpReport {
+                stream_index,
+                flow,
+                received,
+                lost,
+                loss_pct,
+                jitter_ms,
+            } => {
+                if let Some(row) = self.live.rows.get_mut(stream_index as usize) {
+                    // For a TX flow this is the only loss figure there is: the
+                    // server's count of what arrived.
+                    row.loss = loss_pct / 100.0;
+                    if flow == Flow::Rx || row.jitter_ms.is_none() {
+                        row.jitter_ms = Some(jitter_ms);
+                    }
+                }
+                let (label, level) = match flow {
+                    Flow::Tx => ("TX, as reported by the server", LogLevel::Info),
+                    Flow::Rx => ("RX", LogLevel::Info),
+                };
+                self.live.push_log(
+                    if loss_pct > 1.0 { LogLevel::Warn } else { level },
+                    format!(
+                        "stream #{} {label}: loss {loss_pct:.2}% ({lost} of {} packets), jitter {jitter_ms:.2} ms",
+                        stream_index + 1,
+                        received + lost
+                    ),
+                );
+            }
             NetEvent::ClientError { stream_index, message } => {
                 self.live.running = false;
                 self.live.connecting = false;
@@ -1804,6 +1923,100 @@ mod tests {
     }
 
     // ── ConfigState ─────────────────────────────────────────────────────
+
+    #[test]
+    fn a_rate_search_logs_its_probes_and_records_its_result() {
+        use crate::net::ProbeResult;
+        let mut app = App::default();
+        app.config.protocol = 1;
+        app.config.bandwidth = "auto".into();
+        app.config.port = "9".into();
+        assert!(app.start_client_test());
+        assert!(
+            app.live.log.iter().any(|l| l.text == RATE_SEARCH_NOTE),
+            "starting a search must say what is about to happen"
+        );
+        assert!(
+            !app.live.log.iter().any(|l| l.text == UNTHROTTLED_UDP_NOTE),
+            "a search is not an unthrottled test"
+        );
+        assert!(app.live.settings.as_ref().unwrap().rate_search);
+
+        let probe = |index, target_bps, delivered_bps, loss_pct, verdict| ProbeResult {
+            index,
+            target_bps,
+            offered_bps: target_bps,
+            delivered_bps,
+            loss_pct,
+            jitter_ms: 0.02,
+            verdict,
+        };
+        app.handle_net_event(NetEvent::RateProbe(probe(
+            1,
+            1_000_000_000,
+            1_000_000_000,
+            0.0,
+            ProbeVerdict::Pass,
+        )));
+        app.handle_net_event(NetEvent::RateProbe(probe(
+            2,
+            2_000_000_000,
+            1_700_000_000,
+            15.0,
+            ProbeVerdict::Fail,
+        )));
+        let log: Vec<_> = app.live.log.iter().map(|l| l.text.clone()).collect();
+        assert!(log.iter().any(|l| l.contains("probe 1") && l.contains("loss-free")), "{log:?}");
+        assert!(log.iter().any(|l| l.contains("probe 2") && l.contains("LOSS")), "{log:?}");
+
+        let best = probe(1, 1_000_000_000, 1_000_000_000, 0.0, ProbeVerdict::Pass);
+        app.handle_net_event(NetEvent::RateSearchDone {
+            best: Some(best),
+            probes: 5,
+            reason: SearchStop::Converged,
+        });
+        let run = app.live.snapshot();
+        assert_eq!(run.summary, "max loss-free 1.00 Gbit/s · 5 probes");
+        assert!((run.avg_gbps - 1.0).abs() < 1e-9 && (run.peak_gbps - 1.0).abs() < 1e-9);
+        let found = run.rate_search.expect("the result is stored with the run");
+        assert_eq!((found.best_bps, found.probes), (Some(1_000_000_000), 5));
+        assert!(run.settings.unwrap().describe().contains("rate search"));
+    }
+
+    #[test]
+    fn a_finished_search_without_a_clean_rate_says_so() {
+        let mut app = App::default();
+        app.handle_net_event(NetEvent::RateSearchDone {
+            best: None,
+            probes: 3,
+            reason: SearchStop::NothingFits,
+        });
+        assert_eq!(app.live.snapshot().summary, "no loss-free rate found · 3 probes");
+    }
+
+    #[test]
+    fn starting_unthrottled_udp_warns_that_loss_means_overload() {
+        let mut app = App::default();
+        app.config.host = "127.0.0.1".into();
+        app.config.port = "9".into(); // nothing listens; the connect just fails
+        app.config.protocol = 1; // UDP
+        app.config.direction = 1; // TX only
+        app.config.bandwidth = "0".into();
+        assert!(app.start_client_test());
+        assert!(
+            app.live.log.iter().any(|l| l.text == UNTHROTTLED_UDP_NOTE),
+            "an unthrottled UDP test must say what its loss figure means"
+        );
+
+        // With a rate there is nothing to warn about, and TCP never warns.
+        app.config.bandwidth = "100M".into();
+        assert!(app.start_client_test());
+        assert!(!app.live.log.iter().any(|l| l.text == UNTHROTTLED_UDP_NOTE));
+        app.config.protocol = 0;
+        app.config.bandwidth = "0".into();
+        assert!(app.start_client_test());
+        assert!(!app.live.log.iter().any(|l| l.text == UNTHROTTLED_UDP_NOTE));
+    }
 
     #[test]
     fn interval_accepts_whole_seconds_in_range_only() {
@@ -2226,6 +2439,7 @@ mod tests {
             chart: Vec::new(),
             chart_rx: Vec::new(),
             settings: None,
+            rate_search: None,
         }
     }
 
