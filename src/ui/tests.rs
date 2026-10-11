@@ -429,3 +429,67 @@ fn history_shows_a_rate_search_result_and_how_it_ended() {
     assert_has(&screen, "rate search");
     assert_has(&screen, "search: converged on the limit");
 }
+
+// ── Live graph axes ─────────────────────────────────────────────────────
+
+/// A running TCP test with `n` one-second samples of rising throughput.
+fn live_with_history(n: usize, interval_secs: u64) -> App {
+    let mut app = app_on(Tab::Live);
+    app.live.target = "10.0.0.5:5201".into();
+    app.live.proto = "TCP".into();
+    app.live.running = true;
+    app.live.settings = Some(RunSettings { interval_secs, ..Default::default() });
+    app.live.rows = vec![row(1, None)];
+    // Throughput history is kept in hundredths of Gbit/s: 100 = 1.00 Gbit/s.
+    app.live.tx_hist = (1..=n as u64).map(|i| i * 100).collect();
+    app.live.rx_hist = (1..=n as u64).map(|i| i * 50).collect();
+    app
+}
+
+#[test]
+fn live_graphs_label_their_value_axis_with_the_largest_visible_sample() {
+    // TX peaks at 12.00 Gbit/s, RX at 6.00.
+    let screen = render(&live_with_history(12, 1), W, H);
+    assert_has(&screen, "12.0");
+    assert_has(&screen, "6.00");
+}
+
+#[test]
+fn live_graphs_label_their_time_axis_from_zero_to_the_newest_sample() {
+    let screen = render(&live_with_history(12, 1), W, H);
+    assert_has(&screen, "0s");
+    assert_has(&screen, "12s");
+
+    // With a 2 s report interval each sample is two seconds apart.
+    let slow = render(&live_with_history(12, 2), W, H);
+    assert_has(&slow, "24s");
+}
+
+#[test]
+fn live_graphs_say_now_and_count_up_once_the_history_scrolls() {
+    let screen = render(&live_with_history(300, 1), 100, H);
+    assert_has(&screen, "now");
+    assert_lacks(&screen, "300s");
+}
+
+#[test]
+fn live_graphs_still_render_without_axes_when_the_panel_is_tiny() {
+    // No room for axes: must neither panic nor print half a label.
+    for (w, h) in [(20, 6), (40, 12), (60, 20)] {
+        let screen = render(&live_with_history(10, 1), w, h);
+        assert_eq!(screen.lines().count(), h as usize);
+    }
+}
+
+#[test]
+fn the_jitter_graph_has_axes_in_milliseconds() {
+    let mut app = live_with_history(8, 1);
+    app.live.proto = "UDP".into();
+    app.live.jitter_ms = Some(0.40);
+    // Hundredths of a millisecond: 40 = 0.40 ms.
+    app.live.jitter_hist = [10, 20, 40, 30, 20, 10].into_iter().collect();
+    let screen = render(&app, W, H);
+    assert_has(&screen, "Jitter");
+    assert_has(&screen, "0.40");
+    assert_has(&screen, "6s");
+}

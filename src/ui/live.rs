@@ -13,7 +13,7 @@ use crate::ui::titled_block;
 
 pub fn draw(frame: &mut Frame, area: Rect, live: &LiveState) {
     let [metrics_area, mid_area, log_area] =
-        Layout::vertical([Constraint::Length(9), Constraint::Length(9), Constraint::Min(4)])
+        Layout::vertical([Constraint::Length(10), Constraint::Length(9), Constraint::Min(4)])
             .areas(area);
 
     let [tx_area, rx_area, lat_area] = Layout::horizontal([
@@ -23,6 +23,8 @@ pub fn draw(frame: &mut Frame, area: Rect, live: &LiveState) {
     ])
     .areas(metrics_area);
 
+    // One history sample per report interval; the time axis is in seconds.
+    let sample_secs = live.settings.as_ref().map_or(1, |s| s.interval_secs.max(1));
     let rx_measured = live.direction != Direction::Tx;
     let tx_accent = if live.direction == Direction::Rx {
         format!("{} · not sent", live.proto)
@@ -42,6 +44,8 @@ pub fn draw(frame: &mut Frame, area: Rect, live: &LiveState) {
         target: 10.0,
         color: theme::BLUE,
         hist: &live.tx_hist,
+        hist_per_unit: 100.0,
+        sample_secs,
         unit: "Gbit/s",
         scale_label: "target 10G",
     };
@@ -52,6 +56,8 @@ pub fn draw(frame: &mut Frame, area: Rect, live: &LiveState) {
         target: 10.0,
         color: theme::GREEN,
         hist: &live.rx_hist,
+        hist_per_unit: 100.0,
+        sample_secs,
         unit: "Gbit/s",
         scale_label: "target 10G",
     };
@@ -74,6 +80,8 @@ pub fn draw(frame: &mut Frame, area: Rect, live: &LiveState) {
             target: 5.0,
             color: theme::TEAL,
             hist: &live.jitter_hist,
+            hist_per_unit: 100.0,
+            sample_secs,
             unit: "ms",
             scale_label: "scale 5ms",
         },
@@ -84,6 +92,8 @@ pub fn draw(frame: &mut Frame, area: Rect, live: &LiveState) {
             target: 5.0,
             color: theme::TEAL,
             hist: &live.lat_hist,
+            hist_per_unit: 100.0,
+            sample_secs,
             unit: "ms",
             scale_label: "p99: n/a",
         },
@@ -122,23 +132,34 @@ struct Metric<'a> {
     target: f64,
     color: ratatui::style::Color,
     hist: &'a std::collections::VecDeque<u64>,
+    /// How many `hist` units make one `unit` (the buffers hold hundredths).
+    hist_per_unit: f64,
+    /// Seconds between two `hist` samples — the time axis' scale.
+    sample_secs: u64,
     unit: &'a str,
     scale_label: &'a str,
 }
 
 fn draw_metric(frame: &mut Frame, area: Rect, m: &Metric) {
-    let Metric { title, accent, value, target, color, hist, unit, scale_label } = *m;
+    let Metric {
+        title,
+        accent,
+        value,
+        target,
+        color,
+        hist,
+        hist_per_unit,
+        sample_secs,
+        unit,
+        scale_label,
+    } = *m;
     let block = titled_block(title, Some(accent));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let [value_area, gauge_area, scale_area, spark_area] = Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Length(1),
-        Constraint::Length(1),
-        Constraint::Min(2),
-    ])
-    .areas(inner);
+    let [value_area, gauge_area, chart_area] =
+        Layout::vertical([Constraint::Length(1), Constraint::Length(1), Constraint::Min(2)])
+            .areas(inner);
 
     let value_line = Line::from(vec![
         Span::styled(format!("{value:.2} "), Style::new().fg(color).bold()),
@@ -146,32 +167,190 @@ fn draw_metric(frame: &mut Frame, area: Rect, m: &Metric) {
     ]);
     frame.render_widget(Paragraph::new(value_line), value_area);
 
+    // `0 ━━━━━━━━━━──────── target 10G`: the scale label sits on the gauge's own row.
+    let label_width = scale_label.chars().count() as u16 + 1;
+    let [zero_area, bar_area, label_area] = Layout::horizontal([
+        Constraint::Length(2),
+        Constraint::Min(1),
+        Constraint::Length(label_width),
+    ])
+    .areas(gauge_area);
+    frame.render_widget(
+        Paragraph::new(Span::styled("0", Style::new().fg(theme::OVERLAY0))),
+        zero_area,
+    );
     let ratio = (value / target).clamp(0.0, 1.0);
     let gauge = LineGauge::default()
         .filled_style(Style::new().fg(color))
         .unfilled_style(Style::new().fg(theme::SURFACE0))
         .ratio(ratio)
         .label("");
-    frame.render_widget(gauge, gauge_area);
+    frame.render_widget(gauge, bar_area);
+    frame.render_widget(
+        Paragraph::new(Span::styled(format!(" {scale_label}"), Style::new().fg(color))),
+        label_area,
+    );
 
-    let scale_line = Line::from(vec![
-        Span::styled("0", Style::new().fg(theme::OVERLAY0)),
-        Span::raw(" ".repeat((scale_area.width as usize).saturating_sub(2 + scale_label.len()))),
-        Span::styled(scale_label, Style::new().fg(color)),
-    ]);
-    frame.render_widget(Paragraph::new(scale_line), scale_area);
+    draw_chart(frame, chart_area, hist, hist_per_unit, sample_secs, color);
+}
+
+/// The sparkline framed by axes:
+///
+/// ```text
+/// 22.0┤▇▇▇█▇▇▅        value axis: ticks on the top and middle rows,
+///     │███████        labelled with the value that row's upper edge stands for
+/// 11.0┤███████
+///     │███████
+///    0┼┬────┬───┬      baseline, with a tick for each time label
+///      0s  3s  7s     time axis
+/// ```
+///
+/// The top label is the largest *visible* sample — the sparkline scales to
+/// exactly that, so the bars and the labels agree.
+fn draw_chart(
+    frame: &mut Frame,
+    area: Rect,
+    hist: &std::collections::VecDeque<u64>,
+    hist_per_unit: f64,
+    sample_secs: u64,
+    color: ratatui::style::Color,
+) {
+    // Axes need room; in a very small panel just draw the bare sparkline.
+    let rows = area.height.saturating_sub(2);
+    if rows < 1 || area.width < 16 {
+        let skip = spark_window_skip(hist.len(), area.width as usize);
+        let data: Vec<u64> = hist.iter().skip(skip).copied().collect();
+        frame.render_widget(Sparkline::default().data(&data).style(Style::new().fg(color)), area);
+        return;
+    }
+
+    // Fixed per history (not per visible window) so the plot doesn't shift
+    // sideways when old samples scroll out.
+    let label_width = axis_value(hist.iter().copied().max().unwrap_or(0) as f64 / hist_per_unit)
+        .chars()
+        .count()
+        .max(4);
+    let y_width = label_width as u16 + 1; // labels plus the axis character
+    let plot_width = area.width - y_width;
 
     // `hist` starts empty and can grow well past the render width (see
-    // `SPARK_LEN`'s doc comment) — `spark_window` picks the tail that fits
+    // `SPARK_LEN`'s doc comment) — `spark_window_skip` picks the tail that fits
     // it. Early on (fewer samples than the box is wide) that's the whole
     // history, so `Sparkline` — which always draws starting at its area's
     // left edge — draws a curve that visibly *grows* from x=0 as real
     // samples arrive. Only once there's more history than the box can show
     // does this start showing a scrolling, right-anchored window instead.
-    let skip = spark_window_skip(hist.len(), spark_area.width as usize);
+    let skip = spark_window_skip(hist.len(), plot_width as usize);
     let data: Vec<u64> = hist.iter().skip(skip).copied().collect();
-    let spark = Sparkline::default().data(&data).style(Style::new().fg(color));
-    frame.render_widget(spark, spark_area);
+    let visible_max = data.iter().copied().max().unwrap_or(0) as f64 / hist_per_unit;
+
+    let plot = Rect { x: area.x + y_width, y: area.y, width: plot_width, height: rows };
+    frame.render_widget(Sparkline::default().data(&data).style(Style::new().fg(color)), plot);
+
+    let axis = Style::new().fg(theme::SURFACE1);
+    let text = Style::new().fg(theme::OVERLAY0);
+    let tick_rows: &[u16] = if rows >= 4 { &[0, rows / 2] } else { &[0] };
+    let mut y_lines = Vec::with_capacity(rows as usize + 1);
+    for row in 0..rows {
+        // The value a row's upper edge stands for: the top row is the maximum.
+        let line = if tick_rows.contains(&row) {
+            let edge = visible_max * f64::from(rows - row) / f64::from(rows);
+            vec![
+                Span::styled(format!("{:>label_width$}", axis_value(edge)), text),
+                Span::styled("┤", axis),
+            ]
+        } else {
+            vec![Span::raw(" ".repeat(label_width)), Span::styled("│", axis)]
+        };
+        y_lines.push(Line::from(line));
+    }
+    let (baseline, labels) = x_axis(hist.len(), skip, plot_width as usize, sample_secs);
+    y_lines.push(Line::from(vec![
+        Span::styled(format!("{:>label_width$}", "0"), text),
+        Span::styled("┼", axis),
+        Span::styled(baseline, axis),
+    ]));
+    y_lines.push(Line::from(vec![
+        Span::raw(" ".repeat(y_width as usize)),
+        Span::styled(labels, text),
+    ]));
+    let column = Rect { height: rows + 2, ..area };
+    frame.render_widget(Paragraph::new(y_lines), column);
+}
+
+/// A value-axis label with a sensible number of digits: `21.2`, `0.48`, `130`.
+fn axis_value(v: f64) -> String {
+    if v >= 100.0 {
+        format!("{v:.0}")
+    } else if v >= 10.0 {
+        format!("{v:.1}")
+    } else {
+        format!("{v:.2}")
+    }
+}
+
+/// `45s`, `2m05s`, `1h02m` — compact, since axis labels are short on room.
+fn time_label(secs: u64) -> String {
+    match secs {
+        0..=119 => format!("{secs}s"),
+        120..=3599 => format!("{}m{:02}s", secs / 60, secs % 60),
+        _ => format!("{}h{:02}m", secs / 3600, secs % 3600 / 60),
+    }
+}
+
+/// The time axis as two lines of exactly `width` characters: the baseline
+/// (with a `┬` tick under each label) and the labels.
+///
+/// Sample `k` covers the interval ending at `(k + 1) * sample_secs`, so the
+/// plot starts at `skip * sample_secs`. While the whole history fits, the
+/// right label sits under the newest sample and gives the elapsed time; once
+/// it scrolls, the right edge is `now` and the left label counts up. A middle
+/// label is added when there is room.
+pub(crate) fn x_axis(len: usize, skip: usize, width: usize, sample_secs: u64) -> (String, String) {
+    let secs = sample_secs.max(1);
+    let mut baseline = vec!['─'; width];
+    let mut labels = vec![' '; width];
+    if width == 0 {
+        return (String::new(), String::new());
+    }
+    let mut put = |text: &str, start: usize, tick: usize| {
+        for (i, c) in text.chars().enumerate() {
+            if let Some(slot) = labels.get_mut(start + i) {
+                *slot = c;
+            }
+        }
+        baseline[tick] = '┬';
+    };
+
+    let left = time_label(skip as u64 * secs);
+    let left_len = left.chars().count();
+    put(&left, 0, 0);
+
+    let visible = len - skip;
+    // Column of the newest sample (the right edge once the plot scrolls).
+    let newest = if skip > 0 { width - 1 } else { visible.saturating_sub(1).min(width - 1) };
+    let right = if skip > 0 { "now".to_string() } else { time_label(len as u64 * secs) };
+    let right_len = right.chars().count();
+    let right_start = (newest + 1).saturating_sub(right_len);
+    let right_fits = visible > 0 && right_start > left_len;
+    if right_fits {
+        put(&right, right_start, newest);
+    }
+
+    // A middle label, centred under its tick, if it clears both neighbours.
+    let mid_col = newest / 2;
+    let mid = time_label((skip + mid_col) as u64 * secs);
+    let mid_len = mid.chars().count();
+    let mid_start = mid_col.saturating_sub(mid_len / 2);
+    let right_edge = if right_fits { right_start } else { width };
+    if visible > 0 && mid_start > left_len && mid_start + mid_len < right_edge {
+        put(&mid, mid_start, mid_col);
+    }
+    if skip == 0 {
+        // The origin: the `┼` where the two axes meet already marks it.
+        baseline[0] = '─';
+    }
+    (baseline.into_iter().collect(), labels.into_iter().collect())
 }
 
 /// How many of the oldest samples to skip so the remaining tail is exactly
@@ -267,6 +446,87 @@ fn draw_log(frame: &mut Frame, area: Rect, live: &LiveState) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn x_axis_runs_from_zero_to_the_newest_sample_while_history_fits() {
+        let (baseline, labels) = x_axis(12, 0, 30, 1);
+        assert_eq!((baseline.chars().count(), labels.chars().count()), (30, 30));
+        assert!(labels.starts_with("0s"), "{labels:?}");
+        // The right label ends under the newest sample (column 11), not at the box edge.
+        assert_eq!(labels.trim_end().chars().count(), 12, "{labels:?}");
+        assert!(labels.trim_end().ends_with("12s"), "{labels:?}");
+        // …with a tick on the baseline under the right label; the origin is
+        // marked by the axes' own `┼`, so there is no tick under `0s`.
+        assert_eq!(baseline.chars().next(), Some('─'));
+        assert_eq!(baseline.chars().nth(11), Some('┬'));
+        // Samples are `interval` seconds apart.
+        assert!(x_axis(12, 0, 30, 2).1.trim_end().ends_with("24s"));
+    }
+
+    #[test]
+    fn x_axis_adds_a_middle_label_when_there_is_room() {
+        let (baseline, labels) = x_axis(40, 0, 60, 1);
+        // 40 samples: the middle tick is under column 19, i.e. 19 s in.
+        assert!(labels.contains("19s"), "{labels:?}");
+        assert_eq!(
+            baseline.chars().filter(|c| *c == '┬').count(),
+            2,
+            "mid and right; the origin has none"
+        );
+    }
+
+    #[test]
+    fn x_axis_drops_labels_that_would_collide_or_have_no_data() {
+        assert_eq!(x_axis(0, 0, 20, 1).1.trim_end(), "0s");
+        assert_eq!(x_axis(3, 0, 20, 1).1.trim_end(), "0s", "3 columns cannot hold both labels");
+        // No label may overwrite another.
+        for len in 1..70 {
+            let labels = x_axis(len, 0, 60, 1).1;
+            let words: Vec<&str> = labels.split_whitespace().collect();
+            assert!(words.iter().all(|w| w.ends_with('s')), "{len}: {labels:?}");
+        }
+    }
+
+    #[test]
+    fn x_axis_counts_up_and_ends_in_now_once_the_history_scrolls() {
+        let (baseline, labels) = x_axis(100, 60, 40, 2);
+        assert_eq!((baseline.chars().count(), labels.chars().count()), (40, 40));
+        assert!(labels.starts_with("2m00s"), "{labels:?}"); // 60 samples × 2 s
+        assert!(labels.ends_with("now"), "{labels:?}");
+        assert_eq!(baseline.chars().last(), Some('┬'));
+        assert_eq!(
+            baseline.chars().next(),
+            Some('┬'),
+            "a scrolled plot starts at a real time, not the origin"
+        );
+    }
+
+    #[test]
+    fn x_axis_is_always_exactly_as_wide_as_the_plot() {
+        for width in [0, 1, 5, 17, 80] {
+            for (len, skip) in [(0, 0), (1, 0), (30, 0), (500, 470)] {
+                let (baseline, labels) = x_axis(len, skip, width, 1);
+                assert_eq!((baseline.chars().count(), labels.chars().count()), (width, width));
+            }
+        }
+    }
+
+    #[test]
+    fn time_labels_are_compact() {
+        assert_eq!(time_label(0), "0s");
+        assert_eq!(time_label(119), "119s");
+        assert_eq!(time_label(120), "2m00s");
+        assert_eq!(time_label(305), "5m05s");
+        assert_eq!(time_label(3720), "1h02m");
+    }
+
+    #[test]
+    fn value_axis_labels_use_a_sensible_number_of_digits() {
+        assert_eq!(axis_value(0.0), "0.00");
+        assert_eq!(axis_value(0.48), "0.48");
+        assert_eq!(axis_value(21.25), "21.2");
+        assert_eq!(axis_value(130.4), "130");
+    }
 
     // Regression guard for the sparkline "grows from the middle towards
     // the left instead of from the left towards the right" bug: with
