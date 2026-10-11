@@ -396,7 +396,7 @@ fn push_hist(hist: &mut VecDeque<u64>, v: u64) {
 }
 
 pub const PROTOCOLS: [&str; 3] = ["TCP", "UDP", "QUIC"];
-pub const WINDOWS: [&str; 5] = ["64K", "128K", "256K", "512K", "auto"];
+pub const WINDOWS: [&str; 9] = ["64K", "128K", "256K", "512K", "1M", "2M", "4M", "8M", "auto"];
 pub const MTUS: [&str; 3] = ["1500", "4096", "9000"];
 pub const DIRECTIONS: [&str; 3] = ["TX + RX (bidir)", "TX only", "RX only"];
 pub const TOS: [&str; 4] =

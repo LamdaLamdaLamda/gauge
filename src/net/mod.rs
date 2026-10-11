@@ -256,6 +256,7 @@ pub fn spawn_runtime() -> (UnboundedSender<NetCommand>, UnboundedReceiver<NetEve
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
     use std::sync::atomic::Ordering;
     use std::time::{Duration, Instant};
     use tokio::sync::mpsc::UnboundedReceiver;
@@ -1351,6 +1352,149 @@ mod tests {
                     panic!("an unknown algorithm must not run a test")
                 }
                 _ => {}
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn udp_with_a_window_enlarges_socket_buffers_and_still_moves_data() {
+        // The window only sizes the socket buffers for UDP; a bidirectional
+        // test with one set on both ends must still flow both ways.
+        let (client_tx, mut client_rx) = unbounded_channel::<NetEvent>();
+        let (mut server_rx, port) = {
+            let (tx, mut rx) = unbounded_channel::<NetEvent>();
+            let params = ServerParams {
+                bind: "127.0.0.1".into(),
+                port: 0,
+                proto: Proto::Udp,
+                window_bytes: Some(4 * 1024 * 1024),
+            };
+            tokio::spawn(server::run_udp(params, tx));
+            let port = match recv(&mut rx).await {
+                NetEvent::ServerListening { bind } => {
+                    bind.rsplit(':').next().unwrap().parse().unwrap()
+                }
+                other => panic!("expected ServerListening, got {other:?}"),
+            };
+            (rx, port)
+        };
+        let stop = Arc::new(AtomicBool::new(false));
+        let params = ClientParams {
+            proto: Proto::Udp,
+            direction: Direction::Bidir,
+            window_bytes: Some(4 * 1024 * 1024),
+            bandwidth_bps: Some(50_000_000),
+            ..tcp_params(port, 2)
+        };
+        tokio::spawn(client::run_stream(params, 0, stop, client_tx));
+
+        let (mut tx_bytes, mut rx_bytes, mut finished) = (0, 0, 0);
+        while finished < 2 {
+            match recv(&mut client_rx).await {
+                NetEvent::ClientStreamFinished { flow: Flow::Tx, total_bytes, .. } => {
+                    tx_bytes = total_bytes;
+                    finished += 1;
+                }
+                NetEvent::ClientStreamFinished { flow: Flow::Rx, total_bytes, .. } => {
+                    rx_bytes = total_bytes;
+                    finished += 1;
+                }
+                NetEvent::ClientError { message, .. } => {
+                    panic!("UDP with a window failed: {message}")
+                }
+                _ => {}
+            }
+        }
+        assert!(tx_bytes > 0 && rx_bytes > 0, "tx {tx_bytes} / rx {rx_bytes}");
+        // The server side wound the peer down as well.
+        loop {
+            if let NetEvent::ServerStreamDisconnected { .. } = recv(&mut server_rx).await {
+                break;
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn udp_server_receives_each_stream_on_its_own_socket() {
+        // Four clients at once, each from its own source port. Every one must
+        // get its own server-side stream that receives and finishes.
+        let (mut server_rx, port) = spawn_server(Proto::Udp).await;
+        let stop = Arc::new(AtomicBool::new(false));
+        let (client_tx, _client_rx) = unbounded_channel::<NetEvent>();
+        for stream_index in 0..4u8 {
+            let params = ClientParams {
+                proto: Proto::Udp,
+                stream_count: 4,
+                bandwidth_bps: Some(50_000_000),
+                session_id: 77,
+                ..tcp_params(port, 2)
+            };
+            tokio::spawn(client::run_stream(params, stream_index, stop.clone(), client_tx.clone()));
+        }
+
+        let (mut connected, mut finished, mut disconnected) = (HashSet::new(), HashSet::new(), 0);
+        while disconnected < 4 {
+            match recv(&mut server_rx).await {
+                NetEvent::ServerStreamConnected { stream_index, .. } => {
+                    connected.insert(stream_index);
+                }
+                NetEvent::ServerStreamFinished {
+                    stream_index, flow: Flow::Rx, avg_gbps, ..
+                } => {
+                    assert!(avg_gbps > 0.0, "stream {stream_index} received nothing");
+                    finished.insert(stream_index);
+                }
+                NetEvent::ServerStreamDisconnected { .. } => disconnected += 1,
+                _ => {}
+            }
+        }
+        assert_eq!(connected.len(), 4);
+        assert_eq!(finished.len(), 4, "every stream must have received on its own socket");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_repeated_udp_handshake_is_acked_again_so_a_lost_ack_is_recoverable() {
+        use super::protocol::{Handshake, HandshakeAck, decode_datagram, encode_datagram};
+
+        let (mut server_rx, port) = spawn_server(Proto::Udp).await;
+        let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        sock.connect(("127.0.0.1", port)).await.unwrap();
+        let hs = encode_datagram(&Handshake {
+            duration_secs: 5,
+            session_id: 9,
+            stream_index: 0,
+            stream_count: 1,
+            direction: Direction::Tx,
+            chunk_bytes: None,
+            tos: None,
+            congestion: None,
+            bandwidth_bps: None,
+            mtu: None,
+            interval_secs: None,
+        })
+        .unwrap();
+
+        // The second handshake reaches the stream's own socket (or races it
+        // on the listener); either way the client must get an ack again.
+        for attempt in 1..=2 {
+            sock.send(&hs).await.unwrap();
+            let mut buf = [0u8; 512];
+            let n = tokio::time::timeout(Duration::from_secs(2), sock.recv(&mut buf))
+                .await
+                .unwrap_or_else(|_| panic!("no ack for handshake #{attempt}"))
+                .unwrap();
+            assert!(decode_datagram::<HandshakeAck>(&buf[..n]).unwrap().ok, "handshake #{attempt}");
+        }
+
+        // A FIN ends the stream promptly and the server cleans it up.
+        let mut fin = vec![0u8; 16];
+        fin[..8].copy_from_slice(&u64::MAX.to_be_bytes());
+        sock.send(&fin).await.unwrap();
+        loop {
+            if let NetEvent::ServerStreamDisconnected { session_id: 9, .. } =
+                recv(&mut server_rx).await
+            {
+                break;
             }
         }
     }

@@ -158,6 +158,11 @@ async fn run_udp_stream(
         let _ = tx.send(err(stream_index, format!("udp connect to {addr} failed: {e}")));
         return;
     }
+    // UDP has no window, but the socket buffers decide how large a burst a
+    // receiver survives without dropping packets, so --window sizes them.
+    if let Some(bytes) = params.window_bytes {
+        let _ = sockopt::grow_socket_buffers(sock.as_raw_fd(), bytes);
+    }
     if let Some(tos) = params.tos.filter(|t| *t != 0) {
         let ipv6 = sock.peer_addr().is_ok_and(|a| a.is_ipv6());
         if let Err(e) = sockopt::set_tos(sock.as_raw_fd(), tos, ipv6) {
@@ -205,45 +210,52 @@ async fn run_udp_stream(
     let start = Instant::now();
     let duration = Duration::from_secs(params.duration_secs.max(1));
     let report_every = report_interval(&params);
-    let sock = &sock;
-    let stop = &*stop;
-    let tx = &tx;
+    let sock = Arc::new(sock);
 
-    // Sending (Tx/Bidir) and receiving (Rx/Bidir) run concurrently on the
-    // one connected socket, just like the TCP duplex loops.
-    let send_part = async {
-        if params.direction == Direction::Rx {
-            return;
-        }
+    // Sending (Tx/Bidir) and receiving (Rx/Bidir) share the one connected
+    // socket but run as two separate tasks. In one task the sender, which
+    // rarely has to wait, would hog the thread and the receiver would
+    // fall behind until the socket buffer overflowed — measured as loss.
+    let send_task = (params.direction != Direction::Rx).then(|| {
+        let (sock, stop, tx) = (sock.clone(), stop.clone(), tx.clone());
         let cfg = udp::TxConfig {
             packet_size: udp_packet_size(params.mtu),
             duration,
             bandwidth_bps: params.bandwidth_bps,
             report_every,
         };
-        let (total, last_elapsed) = udp::tx_loop(cfg, start, stop, sock, None, |report| {
-            send_interval(tx, stream_index, Flow::Tx, report)
+        tokio::spawn(async move {
+            let (total, last_elapsed) = udp::tx_loop(cfg, start, &stop, &sock, None, |report| {
+                send_interval(&tx, stream_index, Flow::Tx, report)
+            })
+            .await;
+            let avg = (total as f64 * 8.0) / start.elapsed().as_secs_f64().max(0.001) / 1e9;
+            send_finished(&tx, stream_index, Flow::Tx, total, last_elapsed.max(1), avg);
         })
-        .await;
-        let avg = (total as f64 * 8.0) / start.elapsed().as_secs_f64().max(0.001) / 1e9;
-        send_finished(tx, stream_index, Flow::Tx, total, last_elapsed.max(1), avg);
-    };
-    let recv_part = async {
-        if params.direction == Direction::Tx {
-            return;
-        }
+    });
+    let recv_task = (params.direction != Direction::Tx).then(|| {
+        let (sock, stop, tx) = (sock.clone(), stop.clone(), tx.clone());
         // The server stops sending at `duration`; leave it a few seconds of
         // slack for the FIN / in-flight packets before giving up.
         let max_wait = duration + udp::IDLE_TIMEOUT;
-        let (total, last_elapsed) =
-            udp::rx_loop(sock, start, stop, max_wait, report_every, |report, quality| {
-                send_udp_rx_interval(tx, stream_index, report, quality)
-            })
+        tokio::spawn(async move {
+            let (total, last_elapsed) = udp::rx_loop(
+                &sock,
+                start,
+                &stop,
+                max_wait,
+                report_every,
+                None,
+                |report, quality| send_udp_rx_interval(&tx, stream_index, report, quality),
+            )
             .await;
-        let avg = (total as f64 * 8.0) / start.elapsed().as_secs_f64().max(0.001) / 1e9;
-        send_finished(tx, stream_index, Flow::Rx, total, last_elapsed.max(1), avg);
-    };
-    tokio::join!(send_part, recv_part);
+            let avg = (total as f64 * 8.0) / start.elapsed().as_secs_f64().max(0.001) / 1e9;
+            send_finished(&tx, stream_index, Flow::Rx, total, last_elapsed.max(1), avg);
+        })
+    });
+    for task in [send_task, recv_task].into_iter().flatten() {
+        let _ = task.await;
+    }
 }
 
 pub(super) fn err(stream_index: u8, message: String) -> NetEvent {

@@ -91,6 +91,23 @@ impl RecvStats {
     }
 }
 
+/// A UDP socket bound to `local` with `SO_REUSEPORT`, connected to `peer` if
+/// given. The server uses this to give every stream its **own** socket on the
+/// listening port: once connected, the kernel delivers that peer's datagrams
+/// to its dedicated socket (an exact 4-tuple match beats the wildcard
+/// listener), so each stream is received by its own task on its own core.
+pub fn reuseport_socket(local: SocketAddr, peer: Option<SocketAddr>) -> std::io::Result<UdpSocket> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    let socket = Socket::new(Domain::for_address(local), Type::DGRAM, Some(Protocol::UDP))?;
+    socket.set_reuse_port(true)?;
+    socket.bind(&local.into())?;
+    if let Some(peer) = peer {
+        socket.connect(&peer.into())?;
+    }
+    socket.set_nonblocking(true)?;
+    UdpSocket::from_std(socket.into())
+}
+
 pub struct TxConfig {
     pub packet_size: usize,
     pub duration: Duration,
@@ -205,7 +222,7 @@ pub struct RxQuality {
     pub jitter_ms: f64,
 }
 
-/// Receives on a connected client socket until the server's FIN, `stop`, an
+/// Receives on a connected socket until the server's FIN, `stop`, an
 /// idle timeout, or `max_wait` (so a vanished server can't hang the test).
 /// Returns `(total_bytes, elapsed_secs_of_last_report)`.
 pub async fn rx_loop(
@@ -214,6 +231,7 @@ pub async fn rx_loop(
     stop: &AtomicBool,
     max_wait: Duration,
     report_every: Duration,
+    reack: Option<&[u8]>,
     mut on_interval: impl FnMut(IntervalReport, RxQuality),
 ) -> (u64, u64) {
     let mut buf = vec![0u8; 65536];
@@ -221,21 +239,47 @@ pub async fn rx_loop(
     let mut last_report = Instant::now();
     let mut last_packet = Instant::now();
     let mut last_elapsed = 0u64;
+    let (mut fin, mut got_data) = (false, false);
 
     while !stop.load(Ordering::Relaxed)
         && start.elapsed() < max_wait
         && last_packet.elapsed() < IDLE_TIMEOUT
     {
-        if let Ok(Ok(n)) =
+        // Wait (bounded) for the first datagram, then drain whatever else is
+        // already queued without awaiting again: one timer and one set of
+        // clock reads per burst instead of per packet. At line rate that
+        // per-packet overhead is what makes a receiver fall behind.
+        if let Ok(Ok(mut n)) =
             tokio::time::timeout(Duration::from_millis(200), sock.recv(&mut buf)).await
         {
-            let data = &buf[..n];
-            if data.len() >= UDP_HEADER && !looks_like_json(data) {
-                if is_fin(data) {
-                    break;
+            let mut drained = 0;
+            loop {
+                let data = &buf[..n];
+                if looks_like_json(data) {
+                    // A repeated handshake: our ack got lost, say it again.
+                    if let Some(ack) = reack {
+                        let _ = sock.send(ack).await;
+                    }
+                } else if data.len() >= UDP_HEADER {
+                    if is_fin(data) {
+                        fin = true;
+                        break;
+                    }
+                    stats.on_packet(data);
+                    got_data = true;
                 }
+                drained += 1;
+                match sock.try_recv(&mut buf) {
+                    Ok(next) if drained < 256 => n = next,
+                    _ => break,
+                }
+            }
+            if got_data {
                 last_packet = Instant::now();
-                stats.on_packet(data);
+                got_data = false;
+            }
+            if fin {
+                break;
             }
         }
 
