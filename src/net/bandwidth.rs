@@ -24,9 +24,23 @@ pub fn parse_bps(s: &str) -> Option<u64> {
     Some((n * mult) as u64)
 }
 
+/// `-b auto` asks for a rate search instead of a fixed rate.
+pub fn is_auto_bandwidth(s: &str) -> bool {
+    s.trim().eq_ignore_ascii_case("auto")
+}
+
 #[cfg(test)]
 mod tests {
-    use super::parse_bps;
+    use super::{is_auto_bandwidth, parse_bps};
+
+    #[test]
+    fn auto_is_recognised_and_is_not_a_rate() {
+        assert!(is_auto_bandwidth("auto"));
+        assert!(is_auto_bandwidth("  AUTO "));
+        assert!(!is_auto_bandwidth("100M"));
+        assert!(!is_auto_bandwidth("0"));
+        assert_eq!(parse_bps("auto"), None, "auto must never be mistaken for a fixed rate");
+    }
 
     #[test]
     fn parses_suffixes() {

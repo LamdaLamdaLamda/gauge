@@ -57,6 +57,24 @@ impl Handshake {
     }
 }
 
+/// What a UDP receiver tells the sender once a stream has ended — the sender
+/// of a UDP flow has no other way to learn how much of it arrived. The server
+/// sends this (a few times, since UDP may drop it) after the client's FIN.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq)]
+pub struct UdpSummary {
+    pub received: u64,
+    pub lost: u64,
+    pub bytes: u64,
+    pub jitter_ms: f64,
+}
+
+impl UdpSummary {
+    pub fn loss_pct(&self) -> f64 {
+        let expected = self.received + self.lost;
+        if expected > 0 { self.lost as f64 / expected as f64 * 100.0 } else { 0.0 }
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct HandshakeAck {
     pub ok: bool,

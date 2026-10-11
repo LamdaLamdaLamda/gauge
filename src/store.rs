@@ -51,6 +51,20 @@ pub struct HistoryRun {
     /// recorded before these were saved.
     #[serde(default)]
     pub settings: Option<RunSettings>,
+    /// Set for runs made with `-b auto` (UDP rate search).
+    #[serde(default)]
+    pub rate_search: Option<RateSearchSummary>,
+}
+
+/// The outcome of a UDP rate search, as stored with the run.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RateSearchSummary {
+    /// The highest loss-free rate found (what arrived), in bit/s; `None` if
+    /// even the lowest probe lost packets.
+    pub best_bps: Option<u64>,
+    pub probes: u32,
+    /// Why the search ended, in words ("converged", "sender-limited", …).
+    pub reason: String,
 }
 
 /// The options of a run that change its result but aren't visible in the
@@ -67,6 +81,9 @@ pub struct RunSettings {
     pub interval_secs: u64,
     pub tos: Option<u8>,
     pub congestion: Option<String>,
+    /// UDP rate search (`-b auto`) instead of a fixed target rate.
+    #[serde(default)]
+    pub rate_search: bool,
 }
 
 fn human(value: u64, unit_step: u64, suffixes: [&str; 4]) -> String {
@@ -86,6 +103,9 @@ impl RunSettings {
         let mut parts = Vec::new();
         if let Some(b) = self.buffer_bytes {
             parts.push(format!("buffer {}", human(b as u64, 1024, ["B", "K", "M", "G"])));
+        }
+        if self.rate_search {
+            parts.push("rate search".to_string());
         }
         if let Some(bps) = self.bandwidth_bps {
             parts.push(format!("target {}bit/s", human(bps, 1000, ["", "K", "M", "G"])));
@@ -206,7 +226,9 @@ mod tests {
                 interval_secs: 2,
                 tos: Some(0xB8),
                 congestion: Some("bbr".into()),
+                rate_search: false,
             }),
+            rate_search: None,
         }
     }
 

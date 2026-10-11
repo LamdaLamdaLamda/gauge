@@ -17,14 +17,18 @@ mod client;
 mod duplex;
 mod protocol;
 mod quic;
+mod ratesearch;
 mod server;
 mod sockopt;
 mod tcpinfo;
 mod udp;
 mod window;
 
-pub use bandwidth::parse_bps;
+pub use bandwidth::{is_auto_bandwidth, parse_bps};
 pub use protocol::Direction;
+pub use ratesearch::{
+    LOSS_LIMIT_PCT, ProbeResult, StopReason as SearchStop, Verdict as ProbeVerdict,
+};
 pub use sockopt::{CONGESTION_SETTABLE, parse_tos};
 pub use window::parse_window_bytes;
 
@@ -105,6 +109,9 @@ pub struct ClientParams {
     /// TCP congestion-control algorithm name (`None` = OS default). Linux
     /// only — see `sockopt::CONGESTION_SETTABLE`.
     pub congestion: Option<String>,
+    /// UDP only: instead of one test at `bandwidth_bps`, search for the
+    /// highest loss-free rate (see `ratesearch`).
+    pub rate_search: bool,
     pub session_id: u64,
 }
 
@@ -164,6 +171,27 @@ pub enum NetEvent {
         elapsed_secs: u64,
         avg_gbps: f64,
     },
+    /// The final loss/jitter tally of one UDP flow, once it has ended. For
+    /// `Flow::Rx` the client measured it itself; for `Flow::Tx` it is what the
+    /// receiving server reported back (the sender can't otherwise know).
+    ClientUdpReport {
+        stream_index: u8,
+        flow: Flow,
+        received: u64,
+        lost: u64,
+        loss_pct: f64,
+        jitter_ms: f64,
+    },
+    /// One finished probe of a UDP rate search (`-b auto`).
+    RateProbe(ProbeResult),
+    /// The rate search is over. `best` is the highest-delivering probe that
+    /// did not lose packets (if any); the usual per-stream "finished" events
+    /// follow.
+    RateSearchDone {
+        best: Option<ProbeResult>,
+        probes: u32,
+        reason: SearchStop,
+    },
     ClientError {
         stream_index: Option<u8>,
         message: String,
@@ -219,6 +247,9 @@ pub fn spawn_runtime() -> (UnboundedSender<NetCommand>, UnboundedReceiver<NetEve
             let mut server_handle: Option<tokio::task::JoinHandle<()>> = None;
             while let Some(cmd) = cmd_rx.recv().await {
                 match cmd {
+                    NetCommand::StartClient(params, stop) if params.rate_search => {
+                        tokio::spawn(ratesearch::run(params, stop, evt_tx.clone()));
+                    }
                     NetCommand::StartClient(params, stop) => {
                         for stream_index in 0..params.stream_count {
                             tokio::spawn(client::run_stream(
@@ -313,6 +344,7 @@ mod tests {
             interval_secs: 1,
             tos: None,
             congestion: None,
+            rate_search: false,
             session_id: 1,
         };
         tokio::spawn(client::run_stream(params, 0, stop, client_tx));
@@ -390,6 +422,7 @@ mod tests {
             interval_secs: 1,
             tos: None,
             congestion: None,
+            rate_search: false,
             session_id: 1,
         };
         tokio::spawn(client::run_stream(params, 0, stop, client_tx));
@@ -439,6 +472,7 @@ mod tests {
             tos: None,
             congestion: None,
             buffer_bytes: Some(buffer_bytes),
+            rate_search: false,
             session_id: 1,
         };
         tokio::spawn(client::run_stream(params, 0, stop, client_tx));
@@ -501,6 +535,7 @@ mod tests {
             tos: None,
             congestion: None,
             buffer_bytes: Some(4096),
+            rate_search: false,
             session_id: 1,
         };
         tokio::spawn(client::run_stream(params, 0, stop, client_tx));
@@ -557,6 +592,7 @@ mod tests {
             interval_secs: 1,
             tos: None,
             congestion: None,
+            rate_search: false,
             session_id: 1,
         };
         tokio::spawn(client::run_stream(params, 0, stop, client_tx));
@@ -565,15 +601,21 @@ mod tests {
             recv(&mut client_rx).await,
             NetEvent::ClientStreamConnected { stream_index: 0, .. }
         ));
+        let mut server_tally = None;
         let total_bytes = loop {
             match recv(&mut client_rx).await {
                 NetEvent::ClientStreamInterval { stream_index: 0, .. } => continue,
+                NetEvent::ClientUdpReport { flow: Flow::Tx, received, lost, .. } => {
+                    server_tally = Some(received + lost);
+                }
                 NetEvent::ClientStreamFinished { stream_index: 0, total_bytes: t, .. } => break t,
                 other => panic!("unexpected client event: {other:?}"),
             }
         };
         assert!(total_bytes > 0, "expected some bytes sent");
         let expected_packet_size = client::udp_packet_size(576) as u64;
+        // The server's own count of the flow must match what was sent.
+        assert_eq!(server_tally, Some(total_bytes / expected_packet_size));
         assert!(
             expected_packet_size < 1200,
             "sanity check: a 576 MTU should produce packets smaller than the old hardcoded 1200"
@@ -615,6 +657,7 @@ mod tests {
             interval_secs: 1,
             tos: None,
             congestion: None,
+            rate_search: false,
             session_id: 77,
         };
         let (client_tx, mut client_rx) = unbounded_channel::<NetEvent>();
@@ -675,6 +718,7 @@ mod tests {
             interval_secs: 1,
             tos: None,
             congestion: None,
+            rate_search: false,
             session_id: 9,
         };
         tokio::spawn(client::run_stream(params, 0, stop, client_tx));
@@ -744,6 +788,7 @@ mod tests {
             interval_secs: 1,
             tos: None,
             congestion: None,
+            rate_search: false,
             session_id: 5,
         };
         tokio::spawn(client::run_stream(params, 0, stop, client_tx));
@@ -794,6 +839,7 @@ mod tests {
             interval_secs: 1,
             tos: None,
             congestion: None,
+            rate_search: false,
             session_id: 42,
         };
         tokio::spawn(client::run_stream(params, 0, stop, client_tx));
@@ -856,6 +902,7 @@ mod tests {
             interval_secs: 1,
             tos: None,
             congestion: None,
+            rate_search: false,
             session_id: 43,
         };
         tokio::spawn(client::run_stream(params, 0, stop, client_tx));
@@ -1011,6 +1058,7 @@ mod tests {
             interval_secs: 1,
             tos: None,
             congestion: None,
+            rate_search: false,
             session_id: 9,
         };
         tokio::spawn(client::run_stream(params, 0, client_stop, client_tx));
@@ -1056,6 +1104,7 @@ mod tests {
             interval_secs: 1,
             tos: None,
             congestion: None,
+            rate_search: false,
             session_id: 1,
         }
     }
@@ -1496,6 +1545,138 @@ mod tests {
             {
                 break;
             }
+        }
+    }
+
+    /// Runs a (shrunken) rate search against a loopback server and returns all
+    /// events it produced.
+    async fn run_search(
+        direction: Direction,
+        streams: u8,
+        settings: ratesearch::SearchSettings,
+    ) -> Vec<NetEvent> {
+        let (_server_rx, port) = spawn_server(Proto::Udp).await;
+        let (tx, mut rx) = unbounded_channel::<NetEvent>();
+        let params = ClientParams {
+            proto: Proto::Udp,
+            direction,
+            stream_count: streams,
+            rate_search: true,
+            ..tcp_params(port, 1)
+        };
+        tokio::spawn(ratesearch::run_with(settings, params, Arc::new(AtomicBool::new(false)), tx));
+        let expected_finishes = streams as usize * direction.flow_count() as usize;
+        let (mut events, mut finished) = (Vec::new(), 0);
+        while finished < expected_finishes {
+            let evt = tokio::time::timeout(Duration::from_secs(40), rx.recv())
+                .await
+                .expect("the search must finish")
+                .expect("event channel closed");
+            if let NetEvent::ClientError { message, .. } = &evt {
+                panic!("rate search failed: {message}");
+            }
+            if matches!(evt, NetEvent::ClientStreamFinished { .. }) {
+                finished += 1;
+            }
+            events.push(evt);
+        }
+        events
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rate_search_probes_ramps_up_and_reports_a_result_per_stream() {
+        // Loopback carries far more than these modest rates (which even a busy
+        // debug build can send), so both probes pass and the search stops at
+        // its shrunken maximum.
+        let settings = ratesearch::SearchSettings {
+            start_bps: 50_000_000,
+            max_bps: 100_000_000,
+            probe_secs: 1,
+        };
+        let events = run_search(Direction::Tx, 2, settings).await;
+
+        let probes: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                NetEvent::RateProbe(p) => Some(*p),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            probes.iter().map(|p| p.target_bps).collect::<Vec<_>>(),
+            vec![50_000_000, 100_000_000]
+        );
+        for p in &probes {
+            assert_eq!(p.verdict, ProbeVerdict::Pass, "{p:?}");
+            assert!(p.loss_pct <= ratesearch::LOSS_LIMIT_PCT);
+            let off = (p.delivered_bps as f64 / p.target_bps as f64 - 1.0).abs();
+            assert!(off < 0.25, "delivered rate should track the target: {p:?}");
+        }
+
+        let done = events.iter().find_map(|e| match e {
+            NetEvent::RateSearchDone { best, probes, reason } => Some((*best, *probes, *reason)),
+            _ => None,
+        });
+        let (best, n, reason) = done.expect("a RateSearchDone event");
+        assert_eq!((n, reason), (2, SearchStop::MaxRate));
+        assert_eq!(best.unwrap().target_bps, 100_000_000, "the highest clean probe wins");
+
+        // The usual per-stream "finished" events close the test, carrying the
+        // bytes sent over the whole search.
+        let finished: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                NetEvent::ClientStreamFinished { stream_index, total_bytes, .. } => {
+                    Some((*stream_index, *total_bytes))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(finished.len(), 2);
+        assert!(finished.iter().all(|(_, bytes)| *bytes > 0));
+
+        // Intervals are forwarded with a continuous time axis across probes.
+        let max_elapsed = events
+            .iter()
+            .filter_map(|e| match e {
+                NetEvent::ClientStreamInterval { stats, .. } => Some(stats.elapsed_secs),
+                _ => None,
+            })
+            .max()
+            .unwrap();
+        assert!(
+            max_elapsed >= 2,
+            "the second probe's samples must come after the first's (got {max_elapsed})"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rate_search_measures_both_directions_of_a_bidirectional_test() {
+        let settings = ratesearch::SearchSettings {
+            start_bps: 50_000_000,
+            max_bps: 50_000_000,
+            probe_secs: 1,
+        };
+        let events = run_search(Direction::Bidir, 1, settings).await;
+        let probe = events
+            .iter()
+            .find_map(|e| match e {
+                NetEvent::RateProbe(p) => Some(*p),
+                _ => None,
+            })
+            .expect("one probe");
+        assert_eq!(probe.verdict, ProbeVerdict::Pass, "{probe:?}");
+        assert!(probe.delivered_bps > 40_000_000, "both flows must have delivered: {probe:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rate_search_refuses_non_udp_protocols() {
+        let (tx, mut rx) = unbounded_channel::<NetEvent>();
+        let params = ClientParams { rate_search: true, ..tcp_params(1, 1) };
+        tokio::spawn(ratesearch::run(params, Arc::new(AtomicBool::new(false)), tx));
+        match recv(&mut rx).await {
+            NetEvent::ClientError { message, .. } => assert!(message.contains("UDP"), "{message}"),
+            other => panic!("expected a refusal, got {other:?}"),
         }
     }
 }

@@ -15,9 +15,11 @@ use serde::Serialize;
 
 use crate::app::OMIT_SECS;
 use crate::config;
-use crate::net::{self, ClientParams, Direction, Flow, NetCommand, NetEvent, Proto, ServerParams};
-use crate::store::{self, HistoryRun};
-use crate::util::now_hms;
+use crate::net::{
+    self, ClientParams, Direction, Flow, NetCommand, NetEvent, ProbeVerdict, Proto, ServerParams,
+};
+use crate::store::{self, HistoryRun, RateSearchSummary};
+use crate::util::{fmt_rate, now_hms};
 
 /// gauge — a network performance tester (TCP/UDP/QUIC, client & server).
 ///
@@ -77,9 +79,11 @@ pub struct ClientArgs {
     /// Both directions at once, over the same connection.
     #[arg(long, conflicts_with = "reverse")]
     bidir: bool,
-    /// Target bitrate for UDP, e.g. "100M" or "1G" — unthrottled if
-    /// omitted (and not set in the config file). Ignored for TCP, which
-    /// relies on congestion control instead.
+    /// Target bitrate for UDP, e.g. "100M" or "1G" — unthrottled if omitted
+    /// (and not set in the config file). Ignored for TCP, which relies on
+    /// congestion control instead. "auto" searches for the highest rate that
+    /// arrives without loss (probes of 2 s that double until packets are
+    /// lost, then narrow in); -t is not used then.
     #[arg(short, long)]
     bandwidth: Option<String>,
     /// TCP window/buffer size applied to the connecting socket (SO_SNDBUF/
@@ -261,6 +265,11 @@ pub fn run_client(args: ClientArgs) -> i32 {
         Direction::Rx => "RX",
         Direction::Bidir => "bidir",
     };
+    let rate_search = bandwidth.as_deref().is_some_and(net::is_auto_bandwidth);
+    if rate_search && proto != Proto::Udp {
+        eprintln!("error: -b auto (rate search) only works with --udp");
+        return 1;
+    }
     let bandwidth_bps =
         if proto == Proto::Udp { bandwidth.as_deref().and_then(net::parse_bps) } else { None };
     let stream_count = parallel.max(1);
@@ -284,6 +293,7 @@ pub fn run_client(args: ClientArgs) -> i32 {
         interval_secs: interval,
         tos,
         congestion,
+        rate_search,
         session_id: new_session_id(),
     };
     let _ = cmd_tx.send(NetCommand::StartClient(params, stop));
@@ -292,8 +302,15 @@ pub fn run_client(args: ClientArgs) -> i32 {
         println!(
             "gauge client → {host}:{port}  ({proto_label} · {stream_count} stream(s) · {dir_label} · {duration}s)"
         );
+        if rate_search {
+            println!("note: {}", crate::app::RATE_SEARCH_NOTE);
+        } else if proto == Proto::Udp && bandwidth_bps.is_none() {
+            println!("note: {}", crate::app::UNTHROTTLED_UDP_NOTE);
+        }
     }
 
+    // Set when a rate search (-b auto) finishes.
+    let mut search_summary: Option<RateSearchSummary> = None;
     let mut per_stream_tx = vec![0.0f64; stream_count as usize];
     let mut per_stream_rx = vec![0.0f64; stream_count as usize];
     // Cumulative per the kernel, so the latest value per stream is already
@@ -364,7 +381,7 @@ pub fn run_client(args: ClientArgs) -> i32 {
                             tx_chart.push((stats.elapsed_secs as f64, aggregate));
                             let from_secs =
                                 std::mem::replace(&mut last_sample_secs[0], stats.elapsed_secs);
-                            if !json {
+                            if !json && !rate_search {
                                 println!(
                                     "[sum] {:>3}-{:>3}s  TX {aggregate:>7.2} Gbit/s",
                                     from_secs, stats.elapsed_secs
@@ -380,7 +397,7 @@ pub fn run_client(args: ClientArgs) -> i32 {
                             rx_chart.push((stats.elapsed_secs as f64, aggregate));
                             let from_secs =
                                 std::mem::replace(&mut last_sample_secs[1], stats.elapsed_secs);
-                            if !json {
+                            if !json && !rate_search {
                                 // UDP receivers measure these themselves (stream 0's, not an aggregate).
                                 let quality = match (stats.loss_pct, stats.jitter_ms) {
                                     (Some(loss), Some(jitter)) => {
@@ -405,6 +422,50 @@ pub fn run_client(args: ClientArgs) -> i32 {
                 finished += 1;
                 if finished >= expected_finishes {
                     break;
+                }
+            }
+            NetEvent::RateProbe(p) => {
+                if !json {
+                    let mark = match p.verdict {
+                        ProbeVerdict::Pass => "ok",
+                        ProbeVerdict::Fail => "LOSS",
+                        ProbeVerdict::SenderLimited => "sender limit",
+                    };
+                    println!(
+                        "[probe {:>2}] target {:>13} → delivered {:>13}  loss {:>6.2}%  jitter {:.2}ms  {mark}",
+                        p.index,
+                        fmt_rate(p.target_bps),
+                        fmt_rate(p.delivered_bps),
+                        p.loss_pct,
+                        p.jitter_ms
+                    );
+                }
+            }
+            NetEvent::RateSearchDone { best, probes, reason } => {
+                search_summary = Some(RateSearchSummary {
+                    best_bps: best.map(|b| b.delivered_bps),
+                    probes,
+                    reason: crate::app::search_reason_text(reason).to_string(),
+                });
+            }
+            NetEvent::ClientUdpReport {
+                stream_index,
+                flow,
+                received,
+                lost,
+                loss_pct,
+                jitter_ms,
+            } => {
+                if !json {
+                    let who = match flow {
+                        Flow::Tx => "TX (reported by the server)",
+                        Flow::Rx => "RX",
+                    };
+                    println!(
+                        "[#{} {who}] loss {loss_pct:.2}% ({lost} of {} packets), jitter {jitter_ms:.2}ms",
+                        stream_index + 1,
+                        received + lost
+                    );
                 }
             }
             NetEvent::ClientError { stream_index, message } => {
@@ -441,6 +502,18 @@ pub fn run_client(args: ClientArgs) -> i32 {
         Direction::Rx => format!("↓{avg_rx_gbps:.2} Gbit/s avg · peak {peak_rx_gbps:.2}"),
         Direction::Tx => format!("↑{avg_tx_gbps:.2} Gbit/s avg · peak {peak_tx_gbps:.2}"),
     };
+    let summary = match &search_summary {
+        Some(found) => match found.best_bps {
+            Some(b) => format!("max loss-free {} · {} probes", fmt_rate(b), found.probes),
+            None => format!("no loss-free rate found · {} probes", found.probes),
+        },
+        None => summary,
+    };
+    let search_best_gbps = search_summary.as_ref().and_then(|f| f.best_bps).map(|b| b as f64 / 1e9);
+    let (avg_tx_gbps, peak_tx_gbps) = match (&search_summary, search_best_gbps) {
+        (Some(_), best) => (best.unwrap_or(0.0), best.unwrap_or(0.0)),
+        _ => (avg_tx_gbps, peak_tx_gbps),
+    };
     let run = HistoryRun {
         target: format!("{host}:{port}"),
         tag: format!("{proto_label} {dir_label} ×{stream_count}"),
@@ -463,6 +536,7 @@ pub fn run_client(args: ClientArgs) -> i32 {
         retransmits: per_stream_retrans.iter().sum(),
         chart: tx_chart,
         chart_rx: rx_chart,
+        rate_search: search_summary.clone(),
         settings: Some(crate::store::RunSettings {
             buffer_bytes: if proto != Proto::Udp { net::parse_window_bytes(&buffer) } else { None },
             bandwidth_bps,
@@ -470,6 +544,7 @@ pub fn run_client(args: ClientArgs) -> i32 {
             interval_secs: interval,
             tos,
             congestion: if proto != Proto::Udp { congestion_name } else { None },
+            rate_search,
         }),
     };
 
@@ -477,6 +552,20 @@ pub fn run_client(args: ClientArgs) -> i32 {
         match serde_json::to_string_pretty(&run) {
             Ok(s) => println!("{s}"),
             Err(e) => eprintln!("failed to encode result as JSON: {e}"),
+        }
+    } else if let Some(found) = &search_summary {
+        println!("────────────────────────────────────────");
+        match found.best_bps {
+            Some(b) => println!(
+                "highest loss-free rate: {} (loss ≤ {}%), after {} probes — {}",
+                fmt_rate(b),
+                net::LOSS_LIMIT_PCT,
+                found.probes,
+                found.reason
+            ),
+            None => {
+                println!("no loss-free rate found after {} probes — {}", found.probes, found.reason)
+            }
         }
     } else {
         println!("────────────────────────────────────────");
@@ -686,6 +775,9 @@ pub fn run_server(args: ServerArgs) -> i32 {
             NetEvent::ClientStreamConnected { .. }
             | NetEvent::ClientStreamInterval { .. }
             | NetEvent::ClientStreamFinished { .. }
+            | NetEvent::ClientUdpReport { .. }
+            | NetEvent::RateProbe(_)
+            | NetEvent::RateSearchDone { .. }
             | NetEvent::ClientError { .. } => {} // this process never starts a client
         }
     }

@@ -99,7 +99,13 @@ fn draw_detail(frame: &mut Frame, area: Rect, hist: &HistoryState) {
         )),
         // Runs recorded before settings were saved have none to show.
         Line::from(Span::styled(
-            run.settings.as_ref().map(|s| s.describe()).unwrap_or_default(),
+            {
+                let settings = run.settings.as_ref().map(|s| s.describe()).unwrap_or_default();
+                match &run.rate_search {
+                    Some(found) => format!("{settings} · search: {}", found.reason),
+                    None => settings,
+                }
+            },
             Style::new().fg(theme::OVERLAY0),
         )),
     ];

@@ -216,6 +216,7 @@ async fn run_udp_stream(
     // socket but run as two separate tasks. In one task the sender, which
     // rarely has to wait, would hog the thread and the receiver would
     // fall behind until the socket buffer overflowed — measured as loss.
+    let direction = params.direction;
     let send_task = (params.direction != Direction::Rx).then(|| {
         let (sock, stop, tx) = (sock.clone(), stop.clone(), tx.clone());
         let cfg = udp::TxConfig {
@@ -230,6 +231,14 @@ async fn run_udp_stream(
             })
             .await;
             let avg = (total as f64 * 8.0) / start.elapsed().as_secs_f64().max(0.001) / 1e9;
+            // A Tx-only client has no receive task, so it listens for the
+            // server's tally of its flow here (in Bidir the receive task does).
+            // The report goes out before "finished", which ends the test.
+            if direction == Direction::Tx
+                && let Some(peer) = udp::await_peer_summary(&sock, udp::SUMMARY_WAIT).await
+            {
+                send_udp_report(&tx, stream_index, Flow::Tx, &peer);
+            }
             send_finished(&tx, stream_index, Flow::Tx, total, last_elapsed.max(1), avg);
         })
     });
@@ -239,18 +248,30 @@ async fn run_udp_stream(
         // slack for the FIN / in-flight packets before giving up.
         let max_wait = duration + udp::IDLE_TIMEOUT;
         tokio::spawn(async move {
-            let (total, last_elapsed) = udp::rx_loop(
-                &sock,
-                start,
-                &stop,
+            let cfg = udp::RxConfig {
                 max_wait,
                 report_every,
-                None,
-                |report, quality| send_udp_rx_interval(&tx, stream_index, report, quality),
-            )
+                reack: None,
+                expect_peer_summary: direction == Direction::Bidir,
+            };
+            let outcome = udp::rx_loop(&sock, start, &stop, cfg, |report, quality| {
+                send_udp_rx_interval(&tx, stream_index, report, quality)
+            })
             .await;
-            let avg = (total as f64 * 8.0) / start.elapsed().as_secs_f64().max(0.001) / 1e9;
-            send_finished(&tx, stream_index, Flow::Rx, total, last_elapsed.max(1), avg);
+            let avg =
+                (outcome.total_bytes as f64 * 8.0) / start.elapsed().as_secs_f64().max(0.001) / 1e9;
+            send_udp_report(&tx, stream_index, Flow::Rx, &outcome.own);
+            if let Some(peer) = outcome.peer {
+                send_udp_report(&tx, stream_index, Flow::Tx, &peer);
+            }
+            send_finished(
+                &tx,
+                stream_index,
+                Flow::Rx,
+                outcome.total_bytes,
+                outcome.last_elapsed.max(1),
+                avg,
+            );
         })
     });
     for task in [send_task, recv_task].into_iter().flatten() {
@@ -308,6 +329,22 @@ fn send_udp_rx_interval(
             jitter_ms: Some(quality.jitter_ms),
             ..Default::default()
         },
+    });
+}
+
+fn send_udp_report(
+    tx: &UnboundedSender<NetEvent>,
+    stream_index: u8,
+    flow: Flow,
+    summary: &super::protocol::UdpSummary,
+) {
+    let _ = tx.send(NetEvent::ClientUdpReport {
+        stream_index,
+        flow,
+        received: summary.received,
+        lost: summary.lost,
+        loss_pct: summary.loss_pct(),
+        jitter_ms: summary.jitter_ms,
     });
 }
 

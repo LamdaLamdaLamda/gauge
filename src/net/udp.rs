@@ -17,6 +17,7 @@ use std::net::SocketAddr;
 use tokio::net::UdpSocket;
 
 use super::duplex::{IntervalReport, MIN_PARTIAL_INTERVAL};
+use super::protocol::{UdpSummary, decode_datagram};
 
 pub const UDP_HEADER: usize = 16;
 pub const IP_UDP_HEADER_OVERHEAD: u32 = 28; // 20-byte IPv4 + 8-byte UDP header
@@ -78,6 +79,16 @@ impl RecvStats {
         self.prev_transit_ns = Some(transit);
     }
 
+    /// The final tally, as sent back to the sender of this stream.
+    pub fn summary(&self) -> UdpSummary {
+        UdpSummary {
+            received: self.received,
+            lost: self.lost,
+            bytes: self.bytes_total,
+            jitter_ms: self.jitter_ms(),
+        }
+    }
+
     pub fn loss_pct(&self) -> f64 {
         if self.received + self.lost > 0 {
             self.lost as f64 / (self.received + self.lost) as f64 * 100.0
@@ -121,6 +132,41 @@ pub struct TxConfig {
 /// `cfg.duration` (or until `stop`), paced to `cfg.bandwidth_bps` if set,
 /// calling `on_interval` every `cfg.report_every`, then a best-effort FIN
 /// burst. Returns `(total_bytes, elapsed_secs_of_last_report)`.
+/// Waits until the next packet is due, then schedules the one after it.
+///
+/// Tokio's timers have ~1 ms resolution, so sleeping per packet makes a fast
+/// sender wake up late and then fire everything that fell due in a burst —
+/// at several Gbit/s that is hundreds of KB back to back, which a receiver
+/// (or the kernel queue) drops. So: sleep only for the long part of a wait and
+/// yield in a loop for the last stretch (only when packets are that close
+/// together), and never owe more than 50 ms of
+/// catch-up after a long stall (shorter stalls are made up for, so the
+/// average rate stays exact even on a busy machine).
+async fn pace(next_send: &mut Instant, delay: Duration) {
+    const MAX_BACKLOG: Duration = Duration::from_millis(50);
+    // Below this spacing a sleep (which rounds up to ~1 ms) would make a
+    // burst of several packets; only then is spinning worth its CPU cost.
+    const SPIN_BELOW: Duration = Duration::from_micros(500);
+    loop {
+        let now = Instant::now();
+        if now >= *next_send {
+            if now - *next_send > MAX_BACKLOG {
+                *next_send = now - MAX_BACKLOG;
+            }
+            break;
+        }
+        let wait = *next_send - now;
+        if wait >= Duration::from_micros(1500) {
+            tokio::time::sleep(wait - Duration::from_millis(1)).await;
+        } else if delay >= SPIN_BELOW {
+            tokio::time::sleep(wait).await;
+        } else {
+            tokio::task::yield_now().await;
+        }
+    }
+    *next_send += delay;
+}
+
 async fn send_datagram(
     sock: &UdpSocket,
     target: Option<SocketAddr>,
@@ -157,11 +203,7 @@ pub async fn tx_loop(
 
     while start.elapsed() < cfg.duration && !stop.load(Ordering::Relaxed) {
         if let Some(delay) = pace_delay {
-            let now = Instant::now();
-            if now < next_send {
-                tokio::time::sleep(next_send - now).await;
-            }
-            next_send += delay;
+            pace(&mut next_send, delay).await;
         }
 
         let ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos() as u64;
@@ -222,27 +264,51 @@ pub struct RxQuality {
     pub jitter_ms: f64,
 }
 
-/// Receives on a connected socket until the server's FIN, `stop`, an
-/// idle timeout, or `max_wait` (so a vanished server can't hang the test).
-/// Returns `(total_bytes, elapsed_secs_of_last_report)`.
+/// How a receive loop runs.
+pub struct RxConfig<'a> {
+    /// Give up after this long overall (so a vanished peer can't hang a test).
+    pub max_wait: Duration,
+    pub report_every: Duration,
+    /// Sent back whenever a repeated handshake arrives (our ack got lost).
+    pub reack: Option<&'a [u8]>,
+    /// The peer is expected to send back a `UdpSummary` of *our* flow; keep
+    /// listening briefly after the stream ends so it isn't missed.
+    pub expect_peer_summary: bool,
+}
+
+/// What a receive loop returns.
+#[derive(Debug, Clone, Copy)]
+pub struct RxOutcome {
+    pub total_bytes: u64,
+    pub last_elapsed: u64,
+    /// What this side received (loss and jitter measured here).
+    pub own: UdpSummary,
+    /// What the peer says it received of our flow, if it told us.
+    pub peer: Option<UdpSummary>,
+}
+
+/// How long to wait for the peer's summary after a stream ends.
+pub const SUMMARY_WAIT: Duration = Duration::from_millis(1500);
+
+/// Receives on a connected socket until the peer's FIN, `stop`, an idle
+/// timeout, or `cfg.max_wait`.
 pub async fn rx_loop(
     sock: &UdpSocket,
     start: Instant,
     stop: &AtomicBool,
-    max_wait: Duration,
-    report_every: Duration,
-    reack: Option<&[u8]>,
+    cfg: RxConfig<'_>,
     mut on_interval: impl FnMut(IntervalReport, RxQuality),
-) -> (u64, u64) {
+) -> RxOutcome {
     let mut buf = vec![0u8; 65536];
     let mut stats = RecvStats::default();
+    let mut peer: Option<UdpSummary> = None;
     let mut last_report = Instant::now();
     let mut last_packet = Instant::now();
     let mut last_elapsed = 0u64;
     let (mut fin, mut got_data) = (false, false);
 
     while !stop.load(Ordering::Relaxed)
-        && start.elapsed() < max_wait
+        && start.elapsed() < cfg.max_wait
         && last_packet.elapsed() < IDLE_TIMEOUT
     {
         // Wait (bounded) for the first datagram, then drain whatever else is
@@ -256,8 +322,10 @@ pub async fn rx_loop(
             loop {
                 let data = &buf[..n];
                 if looks_like_json(data) {
-                    // A repeated handshake: our ack got lost, say it again.
-                    if let Some(ack) = reack {
+                    if let Ok(summary) = decode_datagram::<UdpSummary>(data) {
+                        peer = Some(summary);
+                    } else if let Some(ack) = cfg.reack {
+                        // A repeated handshake: our ack got lost, say it again.
                         let _ = sock.send(ack).await;
                     }
                 } else if data.len() >= UDP_HEADER {
@@ -283,7 +351,7 @@ pub async fn rx_loop(
             }
         }
 
-        if last_report.elapsed() >= report_every {
+        if last_report.elapsed() >= cfg.report_every {
             let secs = last_report.elapsed().as_secs_f64();
             let gbps = (stats.bytes_interval as f64 * 8.0) / secs / 1e9;
             last_elapsed = start.elapsed().as_secs();
@@ -316,7 +384,37 @@ pub async fn rx_loop(
             RxQuality { loss_pct: stats.loss_pct(), jitter_ms: stats.jitter_ms() },
         );
     }
-    (stats.bytes_total, last_elapsed)
+    if cfg.expect_peer_summary && peer.is_none() {
+        peer = await_peer_summary(sock, SUMMARY_WAIT).await;
+    }
+    RxOutcome { total_bytes: stats.bytes_total, last_elapsed, own: stats.summary(), peer }
+}
+
+/// Waits up to `timeout` for the peer's `UdpSummary`, ignoring anything else.
+pub async fn await_peer_summary(sock: &UdpSocket, timeout: Duration) -> Option<UdpSummary> {
+    let mut buf = [0u8; 512];
+    let deadline = Instant::now() + timeout;
+    loop {
+        let left = deadline.checked_duration_since(Instant::now())?;
+        match tokio::time::timeout(left, sock.recv(&mut buf)).await {
+            Ok(Ok(n)) => {
+                if let Ok(summary) = decode_datagram::<UdpSummary>(&buf[..n]) {
+                    return Some(summary);
+                }
+            }
+            _ => return None,
+        }
+    }
+}
+
+/// Sends a summary to the peer a few times — it is a single UDP datagram and
+/// the sender is waiting for it.
+pub async fn send_summary(sock: &UdpSocket, summary: &UdpSummary) {
+    let Ok(bytes) = super::protocol::encode_datagram(summary) else { return };
+    for _ in 0..3 {
+        let _ = sock.send(&bytes).await;
+        tokio::time::sleep(Duration::from_millis(15)).await;
+    }
 }
 
 #[cfg(test)]
