@@ -9,7 +9,7 @@ TCP · UDP · QUIC &nbsp;|&nbsp; TX / RX / bidirectional &nbsp;|&nbsp; real loss
 ![Rust 1.88+](https://img.shields.io/badge/rust-1.88%2B-orange)
 ![License: MIT](https://img.shields.io/badge/license-MIT-green)
 ![Platforms](https://img.shields.io/badge/platforms-Linux%20%7C%20macOS-blue)
-![Status](https://img.shields.io/badge/status-0.1.0-lightgrey)
+![Status](https://img.shields.io/badge/status-0.2.0-lightgrey)
 
 </div>
 
