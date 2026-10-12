@@ -9,8 +9,8 @@ use tokio::net::{TcpListener, TcpSocket, TcpStream, UdpSocket};
 use tokio::sync::mpsc::UnboundedSender;
 
 use super::protocol::{
-    Direction, Handshake, HandshakeAck, decode_datagram, encode_datagram, read_message,
-    write_message,
+    Direction, Handshake, HandshakeAck, check_client_version, decode_datagram, encode_datagram,
+    read_message, write_message,
 };
 use super::{Flow, NetEvent, ServerParams, StreamStats};
 use super::{duplex, sockopt, udp};
@@ -115,7 +115,11 @@ async fn handle_tcp_client(mut stream: TcpStream, addr: String, tx: UnboundedSen
         Ok(h) => h,
         Err(_) => return,
     };
-    if write_message(&mut stream, &HandshakeAck { ok: true, error: None }).await.is_err() {
+    if let Err(reason) = check_client_version(handshake.protocol_version) {
+        let _ = write_message(&mut stream, &HandshakeAck::refused(reason)).await;
+        return;
+    }
+    if write_message(&mut stream, &HandshakeAck::ok()).await.is_err() {
         return;
     }
     // Mirror the client's QoS marking / congestion choice on our own
@@ -211,22 +215,24 @@ pub async fn run_udp(params: ServerParams, tx: UnboundedSender<NetEvent>) {
                 // Only handshakes arrive here; established peers' datagrams
                 // go to their own sockets. Anything else is dropped.
                 let Ok(hs) = decode_datagram::<Handshake>(&buf[..n]) else { continue };
-                let ack = |ok: bool, error: Option<String>| {
-                    encode_datagram(&HandshakeAck { ok, error }).unwrap_or_default()
-                };
+                let reply = |ack: HandshakeAck| encode_datagram(&ack).unwrap_or_default();
+                if let Err(reason) = check_client_version(hs.protocol_version) {
+                    let _ = socket.send_to(&reply(HandshakeAck::refused(reason)), peer_addr).await;
+                    continue;
+                }
                 if peers.contains(&peer_addr) {
                     // A retransmitted handshake that raced the peer socket's creation.
-                    let _ = socket.send_to(&ack(true, None), peer_addr).await;
+                    let _ = socket.send_to(&reply(HandshakeAck::ok()), peer_addr).await;
                     continue;
                 }
                 match start_udp_peer(local, peer_addr, hs, params.window_bytes, &tx, &done_tx) {
                     Ok(()) => {
                         peers.insert(peer_addr);
-                        let _ = socket.send_to(&ack(true, None), peer_addr).await;
+                        let _ = socket.send_to(&reply(HandshakeAck::ok()), peer_addr).await;
                     }
                     Err(e) => {
                         let msg = format!("server could not set up a socket for this stream: {e}");
-                        let _ = socket.send_to(&ack(false, Some(msg)), peer_addr).await;
+                        let _ = socket.send_to(&reply(HandshakeAck::refused(msg)), peer_addr).await;
                     }
                 }
             }
@@ -307,7 +313,7 @@ async fn udp_peer(
 
     // Client-to-server half (Tx/Bidir), here on the peer task itself.
     if hs.direction != Direction::Rx {
-        let ack = encode_datagram(&HandshakeAck { ok: true, error: None }).unwrap_or_default();
+        let ack = encode_datagram(&HandshakeAck::ok()).unwrap_or_default();
         let max_wait = duration + udp::IDLE_TIMEOUT * 2;
         let cfg =
             udp::RxConfig { max_wait, report_every, reack: Some(&ack), expect_peer_summary: false };

@@ -42,7 +42,7 @@ install: check
 # Run the suite and the lints on Linux in a container (the Linux-only code paths: TCP_INFO, TCP_CONGESTION)
 linux:
     docker run --rm -v "{{justfile_directory()}}":/src:ro rust:latest bash -c ' \
-      mkdir /work && cp -r /src/Cargo.toml /src/Cargo.lock /src/src /src/tests /work/ && \
+      mkdir /work && cp -r /src/Cargo.toml /src/Cargo.lock /src/src /src/tests /src/docs /work/ && \
       cd /work && rustup component add clippy >/dev/null 2>&1 && \
       cargo clippy --all-targets -- -D warnings && cargo test'
 

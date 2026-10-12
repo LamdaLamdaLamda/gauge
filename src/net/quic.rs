@@ -25,10 +25,10 @@ use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer, ServerName, UnixTime
 use tokio::sync::mpsc::UnboundedSender;
 
 use super::client::{
-    err, handshake_for, report_interval, send_finished as client_finished,
+    err, handshake_for, report_interval, require_server_version, send_finished as client_finished,
     send_interval as client_interval,
 };
-use super::protocol::{Handshake, HandshakeAck, read_message, write_message};
+use super::protocol::{Handshake, HandshakeAck, check_client_version, read_message, write_message};
 use super::server::{send_finished as server_finished, send_interval as server_interval};
 use super::{ClientParams, NetEvent, ServerParams, duplex, sockopt};
 
@@ -239,7 +239,11 @@ pub async fn run_client_stream(
         return fail(format!("handshake failed: {e}"));
     }
     match read_message::<HandshakeAck, _>(&mut recv).await {
-        Ok(a) if a.ok => {}
+        Ok(a) if a.ok => {
+            if let Err(reason) = require_server_version(&params, a.protocol_version) {
+                return fail(reason);
+            }
+        }
         Ok(a) => return fail(a.error.unwrap_or_else(|| "server rejected handshake".into())),
         Err(e) => return fail(format!("handshake ack failed: {e}")),
     }
@@ -319,7 +323,11 @@ async fn serve_conn(
         Ok(h) => h,
         Err(_) => return,
     };
-    if write_message(&mut send, &HandshakeAck { ok: true, error: None }).await.is_err() {
+    if let Err(reason) = check_client_version(handshake.protocol_version) {
+        let _ = write_message(&mut send, &HandshakeAck::refused(reason)).await;
+        return;
+    }
+    if write_message(&mut send, &HandshakeAck::ok()).await.is_err() {
         return;
     }
     // Best effort, and endpoint-wide: all QUIC clients share the server's

@@ -79,7 +79,7 @@ Linux, it is worth running the suite on both operating systems before a PR
 
 ```bash
 docker run --rm -v "$PWD":/src:ro rust:latest bash -c '
-  mkdir /work && cp -r /src/Cargo.toml /src/Cargo.lock /src/src /src/tests /work/ &&
+  mkdir /work && cp -r /src/Cargo.toml /src/Cargo.lock /src/src /src/tests /src/docs /work/ &&
   cd /work && rustup component add clippy &&
   cargo clippy --all-targets -- -D warnings && cargo test'
 ```
@@ -124,8 +124,11 @@ A new option usually touches several places. Walk through this checklist:
 
 1. **Engine:** add the field to `ClientParams` (and to `Handshake` in
    `src/net/protocol.rs` if the server must act on it — mark new handshake
-   fields `#[serde(default)]` so older peers keep working), and implement it
-   in `src/net/`.
+   fields `#[serde(default)]` so older peers keep working, and document the
+   field and what its absence means in [docs/protocol.md](docs/protocol.md)),
+   and implement it in `src/net/`. A change that older peers *cannot* cope
+   with needs a new `PROTOCOL_VERSION` instead; see the versioning rules in
+   that document.
 2. **CLI:** add the flag in `src/cli.rs`, with the config-file default noted in
    its help text, and merge it in the order *flag > config file > default*.
 3. **Config file:** add the key to `ClientDefaults` / `ServerDefaults` in
@@ -275,9 +278,11 @@ the PR title should do too, since it often becomes the squash-commit message.
 For maintainers:
 
 1. Make sure `main` is green in CI.
-2. Bump `version` in `Cargo.toml` (following [SemVer](https://semver.org/)) —
-   note that the handshake is not versioned, so a change that breaks older
-   peers is a breaking change.
+2. Bump `version` in `Cargo.toml` (following [SemVer](https://semver.org/);
+   what counts as a breaking change is in [docs/stability.md](docs/stability.md)).
+   If the wire protocol changed in a way older peers can't cope with, also
+   bump `PROTOCOL_VERSION` in `src/net/protocol.rs` and update
+   [docs/protocol.md](docs/protocol.md).
 3. In `CHANGELOG.md`, rename `[Unreleased]` to the new version with the date and
    add a fresh empty `[Unreleased]` section above it.
 4. Run `cargo build --release` and do a short real-network test with the

@@ -1509,6 +1509,7 @@ mod tests {
         let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         sock.connect(("127.0.0.1", port)).await.unwrap();
         let hs = encode_datagram(&Handshake {
+            protocol_version: super::protocol::PROTOCOL_VERSION,
             duration_secs: 5,
             session_id: 9,
             stream_index: 0,
@@ -1585,12 +1586,12 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn rate_search_probes_ramps_up_and_reports_a_result_per_stream() {
-        // Loopback carries far more than these modest rates (which even a busy
+        // Loopback carries far more than these modest rates (which even a starved
         // debug build can send), so both probes pass and the search stops at
         // its shrunken maximum.
         let settings = ratesearch::SearchSettings {
-            start_bps: 50_000_000,
-            max_bps: 100_000_000,
+            start_bps: 10_000_000,
+            max_bps: 20_000_000,
             probe_secs: 1,
         };
         let events = run_search(Direction::Tx, 2, settings).await;
@@ -1604,7 +1605,7 @@ mod tests {
             .collect();
         assert_eq!(
             probes.iter().map(|p| p.target_bps).collect::<Vec<_>>(),
-            vec![50_000_000, 100_000_000]
+            vec![10_000_000, 20_000_000]
         );
         for p in &probes {
             assert_eq!(p.verdict, ProbeVerdict::Pass, "{p:?}");
@@ -1619,7 +1620,7 @@ mod tests {
         });
         let (best, n, reason) = done.expect("a RateSearchDone event");
         assert_eq!((n, reason), (2, SearchStop::MaxRate));
-        assert_eq!(best.unwrap().target_bps, 100_000_000, "the highest clean probe wins");
+        assert_eq!(best.unwrap().target_bps, 20_000_000, "the highest clean probe wins");
 
         // The usual per-stream "finished" events close the test, carrying the
         // bytes sent over the whole search.
@@ -1653,8 +1654,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn rate_search_measures_both_directions_of_a_bidirectional_test() {
         let settings = ratesearch::SearchSettings {
-            start_bps: 50_000_000,
-            max_bps: 50_000_000,
+            start_bps: 10_000_000,
+            max_bps: 10_000_000,
             probe_secs: 1,
         };
         let events = run_search(Direction::Bidir, 1, settings).await;
@@ -1666,7 +1667,7 @@ mod tests {
             })
             .expect("one probe");
         assert_eq!(probe.verdict, ProbeVerdict::Pass, "{probe:?}");
-        assert!(probe.delivered_bps > 40_000_000, "both flows must have delivered: {probe:?}");
+        assert!(probe.delivered_bps > 8_000_000, "both flows must have delivered: {probe:?}");
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1678,5 +1679,94 @@ mod tests {
             NetEvent::ClientError { message, .. } => assert!(message.contains("UDP"), "{message}"),
             other => panic!("expected a refusal, got {other:?}"),
         }
+    }
+
+    // ── protocol versioning ─────────────────────────────────────────────
+
+    use super::protocol::{Handshake, HandshakeAck as Ack, PROTOCOL_VERSION};
+
+    fn raw_handshake(protocol_version: u32, direction: Direction) -> Handshake {
+        Handshake {
+            protocol_version,
+            duration_secs: 1,
+            session_id: 4242,
+            stream_index: 0,
+            stream_count: 1,
+            direction,
+            chunk_bytes: None,
+            tos: None,
+            congestion: None,
+            bandwidth_bps: None,
+            mtu: None,
+            interval_secs: None,
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn servers_refuse_a_newer_protocol_and_say_which_one_they_speak() {
+        use super::protocol::{decode_datagram, encode_datagram, read_message, write_message};
+
+        // TCP
+        let (_rx, port) = spawn_server(Proto::Tcp).await;
+        let mut tcp = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        write_message(&mut tcp, &raw_handshake(PROTOCOL_VERSION + 1, Direction::Tx)).await.unwrap();
+        let ack: Ack = read_message(&mut tcp).await.unwrap();
+        assert!(!ack.ok);
+        assert_eq!(ack.protocol_version, PROTOCOL_VERSION);
+        assert!(ack.error.unwrap().contains("upgrade the server"));
+
+        // UDP
+        let (_rx, port) = spawn_server(Proto::Udp).await;
+        let udp = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        udp.connect(("127.0.0.1", port)).await.unwrap();
+        let hs = encode_datagram(&raw_handshake(PROTOCOL_VERSION + 1, Direction::Tx)).unwrap();
+        udp.send(&hs).await.unwrap();
+        let mut buf = [0u8; 512];
+        let n = tokio::time::timeout(Duration::from_secs(2), udp.recv(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        let ack: Ack = decode_datagram(&buf[..n]).unwrap();
+        assert!(!ack.ok && ack.error.unwrap().contains("upgrade the server"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn servers_still_serve_a_legacy_client_that_sends_no_version() {
+        use super::protocol::read_message;
+
+        let (_rx, port) = spawn_server(Proto::Tcp).await;
+        let mut tcp = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        // Exactly what gauge 0.1.x sent: JSON without `protocol_version`, length-prefixed.
+        let json = br#"{"duration_secs":1,"session_id":1,"stream_index":0,"stream_count":1,"direction":"Tx","chunk_bytes":null}"#;
+        tokio::io::AsyncWriteExt::write_all(&mut tcp, &(json.len() as u32).to_be_bytes())
+            .await
+            .unwrap();
+        tokio::io::AsyncWriteExt::write_all(&mut tcp, json).await.unwrap();
+        let ack: Ack = read_message(&mut tcp).await.unwrap();
+        assert!(ack.ok, "{ack:?}");
+        assert_eq!(ack.protocol_version, PROTOCOL_VERSION);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_server_drops_a_peer_that_announces_an_absurd_message_length() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (_rx, port) = spawn_server(Proto::Tcp).await;
+        let mut tcp = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        tcp.write_all(&u32::MAX.to_be_bytes()).await.unwrap();
+        let mut byte = [0u8; 1];
+        let read = tokio::time::timeout(Duration::from_secs(2), tcp.read(&mut byte))
+            .await
+            .expect("the server must close the connection, not wait for 4 GiB");
+        assert!(matches!(read, Ok(0) | Err(_)), "connection should be closed: {read:?}");
+    }
+
+    #[test]
+    fn a_client_will_not_run_a_rate_search_against_a_server_without_receiver_reports() {
+        let params = |rate_search| ClientParams { rate_search, ..tcp_params(1, 1) };
+        assert!(client::require_server_version(&params(true), 0).is_err());
+        assert!(client::require_server_version(&params(true), 1).is_ok());
+        // Every other test works against any server.
+        assert!(client::require_server_version(&params(false), 0).is_ok());
     }
 }

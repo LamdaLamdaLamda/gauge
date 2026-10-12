@@ -1,6 +1,31 @@
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
+/// The version of gauge's wire protocol this build speaks. It is bumped only
+/// when a change would stop older peers from working; adding an optional
+/// handshake field does not count (see `docs/protocol.md`). Peers that
+/// predate the field (gauge 0.1.x) count as version 0.
+pub const PROTOCOL_VERSION: u32 = 1;
+
+/// The largest handshake message accepted over TCP/QUIC. Real ones are a few
+/// hundred bytes; the cap stops a peer from making us allocate gigabytes by
+/// announcing a huge length.
+pub const MAX_MESSAGE_LEN: usize = 64 * 1024;
+
+/// Whether this build can serve a client speaking `client_version`: anything
+/// up to our own version is fine (we never drop support within a major
+/// release), newer is not.
+pub fn check_client_version(client_version: u32) -> Result<(), String> {
+    if client_version > PROTOCOL_VERSION {
+        Err(format!(
+            "this client speaks gauge protocol {client_version}, but this server only understands \
+             up to {PROTOCOL_VERSION} — please upgrade the server"
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 /// Which way bulk data flows for a test. Chosen by the client and carried
 /// in the handshake so the server knows whether to read, write, or both.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
@@ -19,6 +44,9 @@ pub enum Direction {
 /// server side; `stream_index`/`stream_count` identify this stream within it.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct Handshake {
+    /// The protocol version the client speaks (absent = 0, a 0.1.x client).
+    #[serde(default)]
+    pub protocol_version: u32,
     pub duration_secs: u64,
     pub session_id: u64,
     pub stream_index: u8,
@@ -79,8 +107,21 @@ impl UdpSummary {
 pub struct HandshakeAck {
     pub ok: bool,
     /// Set when `ok` is false, so the client can report *why* instead of
-    /// just failing generically (e.g. UDP doesn't support Rx/Bidir yet).
+    /// just failing generically (e.g. the client is newer than the server).
     pub error: Option<String>,
+    /// The protocol version the server speaks (absent = 0, a 0.1.x server).
+    #[serde(default)]
+    pub protocol_version: u32,
+}
+
+impl HandshakeAck {
+    pub fn ok() -> Self {
+        HandshakeAck { ok: true, error: None, protocol_version: PROTOCOL_VERSION }
+    }
+
+    pub fn refused(reason: String) -> Self {
+        HandshakeAck { ok: false, error: Some(reason), protocol_version: PROTOCOL_VERSION }
+    }
 }
 
 /// Length-prefixed (u32 BE) JSON framing for the TCP control/data stream.
@@ -103,6 +144,12 @@ where
     let mut len_buf = [0u8; 4];
     stream.read_exact(&mut len_buf).await?;
     let len = u32::from_be_bytes(len_buf) as usize;
+    if len > MAX_MESSAGE_LEN {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("message of {len} bytes exceeds the {MAX_MESSAGE_LEN} byte limit"),
+        ));
+    }
     let mut buf = vec![0u8; len];
     stream.read_exact(&mut buf).await?;
     serde_json::from_slice(&buf)
@@ -126,6 +173,7 @@ mod tests {
 
     fn sample_handshake() -> Handshake {
         Handshake {
+            protocol_version: PROTOCOL_VERSION,
             duration_secs: 10,
             session_id: 0xC0FFEE,
             stream_index: 2,
@@ -161,13 +209,13 @@ mod tests {
         // behind that would corrupt whatever comes next.
         let mut buf: Vec<u8> = Vec::new();
         write_message(&mut buf, &sample_handshake()).await.unwrap();
-        write_message(&mut buf, &HandshakeAck { ok: true, error: None }).await.unwrap();
+        write_message(&mut buf, &HandshakeAck::ok()).await.unwrap();
 
         let mut cursor = std::io::Cursor::new(buf);
         let first: Handshake = read_message(&mut cursor).await.unwrap();
         let second: HandshakeAck = read_message(&mut cursor).await.unwrap();
         assert_eq!(first, sample_handshake());
-        assert_eq!(second, HandshakeAck { ok: true, error: None });
+        assert_eq!(second, HandshakeAck::ok());
     }
 
     #[tokio::test]
@@ -203,5 +251,101 @@ mod tests {
         assert_eq!(hs.report_every().as_secs(), 1);
         hs.interval_secs = Some(100_000);
         assert_eq!(hs.report_every().as_secs(), 60);
+    }
+
+    #[test]
+    fn a_handshake_without_a_version_is_a_legacy_peer_at_version_zero() {
+        // What a gauge 0.1.x client sends: no `protocol_version` at all.
+        let json = r#"{"duration_secs":10,"session_id":7,"stream_index":0,"stream_count":1,
+                       "direction":"Tx","chunk_bytes":null}"#;
+        let hs: Handshake = serde_json::from_str(json).unwrap();
+        assert_eq!(hs.protocol_version, 0);
+        assert!(check_client_version(hs.protocol_version).is_ok(), "legacy clients are served");
+
+        let ack: HandshakeAck = serde_json::from_str(r#"{"ok":true,"error":null}"#).unwrap();
+        assert_eq!(ack.protocol_version, 0, "a 0.1.x server's ack carries no version");
+    }
+
+    #[test]
+    fn newer_clients_are_refused_with_a_message_that_says_what_to_do() {
+        assert!(check_client_version(PROTOCOL_VERSION).is_ok());
+        let reason = check_client_version(PROTOCOL_VERSION + 1).unwrap_err();
+        assert!(reason.contains("protocol") && reason.contains("upgrade the server"), "{reason}");
+    }
+
+    #[test]
+    fn our_own_acks_carry_our_version() {
+        assert_eq!(HandshakeAck::ok().protocol_version, PROTOCOL_VERSION);
+        let refused = HandshakeAck::refused("nope".into());
+        assert!(!refused.ok);
+        assert_eq!(
+            (refused.error.as_deref(), refused.protocol_version),
+            (Some("nope"), PROTOCOL_VERSION)
+        );
+    }
+
+    #[tokio::test]
+    async fn an_oversized_message_is_refused_before_anything_is_allocated() {
+        // A peer announcing a 4 GiB message must not make us allocate it.
+        let mut input: &[u8] = &u32::MAX.to_be_bytes();
+        let err = read_message::<Handshake, _>(&mut input).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("limit"), "{err}");
+
+        // Just over the cap is refused, exactly at it is read (and then fails to parse).
+        let mut over: &[u8] = &((MAX_MESSAGE_LEN + 1) as u32).to_be_bytes();
+        assert!(
+            read_message::<Handshake, _>(&mut over)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("limit")
+        );
+    }
+
+    // ── the protocol document must describe what the code really does ────
+
+    const PROTOCOL_DOC: &str = include_str!("../../docs/protocol.md");
+
+    #[test]
+    fn the_protocol_doc_names_the_current_protocol_version() {
+        assert!(
+            PROTOCOL_DOC.contains(&format!("(currently **{PROTOCOL_VERSION}**)")),
+            "docs/protocol.md must say the current protocol version is {PROTOCOL_VERSION}"
+        );
+        assert!(PROTOCOL_DOC.contains(&format!("for protocol **version {PROTOCOL_VERSION}**")));
+    }
+
+    #[test]
+    fn every_json_example_in_the_protocol_doc_parses_as_the_message_it_claims_to_be() {
+        let mut examples = 0;
+        let mut rest = PROTOCOL_DOC;
+        while let Some(start) = rest.find("```json\n") {
+            let after = &rest[start + "```json\n".len()..];
+            let end = after.find("```").expect("unterminated code block");
+            let block = after[..end].trim();
+            rest = &after[end..];
+
+            let parsed = serde_json::from_str::<Handshake>(block).is_ok()
+                || block.lines().all(|line| {
+                    serde_json::from_str::<HandshakeAck>(line).is_ok()
+                        || serde_json::from_str::<UdpSummary>(line).is_ok()
+                });
+            assert!(parsed, "an example in docs/protocol.md no longer parses:\n{block}");
+            examples += 1;
+        }
+        assert!(
+            examples >= 3,
+            "expected the handshake, ack and summary examples, found {examples}"
+        );
+    }
+
+    #[test]
+    fn the_documented_limits_match_the_constants() {
+        assert!(
+            PROTOCOL_DOC.contains(&format!("{}", MAX_MESSAGE_LEN))
+                || PROTOCOL_DOC.contains("65 536")
+        );
+        assert_eq!(MAX_MESSAGE_LEN, 65_536, "docs/protocol.md says 65 536 bytes");
     }
 }
