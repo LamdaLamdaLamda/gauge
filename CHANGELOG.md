@@ -12,6 +12,16 @@ First public version (`0.1.0`). When it is tagged, rename this heading to
 
 ### Added
 
+- **Protocol versioning:** the handshake and its ack carry a `protocol_version`
+  (now 1; a peer that sends none is version 0, i.e. gauge 0.1.x). A server
+  refuses a client that speaks a newer protocol with a message telling the user
+  to upgrade the server; a client refuses to run the rate search against a
+  server too old to report what it received.
+- **Protocol documentation** ([docs/protocol.md](docs/protocol.md)): the
+  handshake, TCP, QUIC and UDP framing, the receiver summary, directions,
+  limits, and the versioning rules; and a [stability policy](docs/stability.md)
+  for what 1.0 will promise.
+
 - **Axes on the Live Test graphs:** every sparkline is framed by a value axis
   (ticks and labels at the top and middle, `0` at the baseline; the top label is
   the largest visible sample, which the bars are scaled to) and a time axis with
@@ -52,7 +62,7 @@ First public version (`0.1.0`). When it is tagged, rename this heading to
 - **Configuration file** (`config.toml`) with defaults for the CLI and the
   TUI; precedence is command-line flag > config file > built-in default.
   `Ctrl+S` on the Config and Server Mode screens saves the current values.
-- **Tests:** 168 tests — state machine, engine integration over real
+- **Tests:** 179 tests — state machine, engine integration over real
   loopback sockets, rendered screens (ratatui `TestBackend`) and end-to-end
   tests that drive the real binary through a pseudo-terminal.
 - **CI** on Linux and macOS: clippy with `-D warnings`, the full test suite
@@ -92,6 +102,11 @@ First public version (`0.1.0`). When it is tagged, rename this heading to
 - A UDP test started without a target rate (`-b`) now prints a note (CLI) or
   logs a warning (TUI) that the loss figure then reflects receiver/path
   overload rather than network quality.
+
+### Security
+
+- Handshake messages over TCP and QUIC are now capped at 64 KiB. Before, a peer
+  could announce a message of up to 4 GiB and make the server allocate it.
 
 ### Notes
 

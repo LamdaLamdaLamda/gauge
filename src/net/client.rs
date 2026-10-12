@@ -7,8 +7,8 @@ use tokio::net::{TcpSocket, TcpStream, UdpSocket};
 use tokio::sync::mpsc::UnboundedSender;
 
 use super::protocol::{
-    Direction, Handshake, HandshakeAck, decode_datagram, encode_datagram, read_message,
-    write_message,
+    Direction, Handshake, HandshakeAck, PROTOCOL_VERSION, decode_datagram, encode_datagram,
+    read_message, write_message,
 };
 use super::{ClientParams, Flow, NetEvent, Proto, StreamStats};
 use super::{duplex, sockopt, udp};
@@ -64,8 +64,25 @@ pub async fn run_stream(
     }
 }
 
+/// The oldest server protocol version each feature works with. Everything
+/// else works against any server; the rate search needs the receiver's report
+/// at the end of a UDP stream, which protocol 1 introduced.
+pub(super) fn require_server_version(
+    params: &ClientParams,
+    server_version: u32,
+) -> Result<(), String> {
+    if params.rate_search && server_version < 1 {
+        return Err(format!(
+            "the server runs an older gauge (protocol {server_version}) that cannot report what \
+             it received, which the rate search (-b auto) needs — upgrade the server"
+        ));
+    }
+    Ok(())
+}
+
 pub(super) fn handshake_for(params: &ClientParams, stream_index: u8) -> Handshake {
     Handshake {
+        protocol_version: PROTOCOL_VERSION,
         duration_secs: params.duration_secs,
         session_id: params.session_id,
         stream_index,
@@ -102,7 +119,12 @@ async fn run_tcp_stream(
         return;
     }
     match read_message::<HandshakeAck, _>(&mut stream).await {
-        Ok(a) if a.ok => {}
+        Ok(a) if a.ok => {
+            if let Err(reason) = require_server_version(&params, a.protocol_version) {
+                let _ = tx.send(err(stream_index, reason));
+                return;
+            }
+        }
         Ok(a) => {
             let reason = a.error.unwrap_or_else(|| "server rejected handshake".into());
             let _ = tx.send(err(stream_index, reason));
@@ -181,6 +203,7 @@ async fn run_udp_stream(
 
     let hs_start = Instant::now();
     let mut acked = false;
+    let mut server_version = 0u32;
     let mut ack_error: Option<String> = None;
     let mut ack_buf = [0u8; 512];
     for _ in 0..8 {
@@ -191,10 +214,13 @@ async fn run_udp_stream(
             tokio::time::timeout(Duration::from_millis(250), sock.recv(&mut ack_buf)).await
             && let Ok(ack) = decode_datagram::<HandshakeAck>(&ack_buf[..n])
         {
-            if ack.ok {
-                acked = true;
-            } else {
+            if !ack.ok {
                 ack_error = ack.error;
+            } else if let Err(reason) = require_server_version(&params, ack.protocol_version) {
+                ack_error = Some(reason);
+            } else {
+                acked = true;
+                server_version = ack.protocol_version;
             }
             break;
         }
@@ -217,6 +243,9 @@ async fn run_udp_stream(
     // rarely has to wait, would hog the thread and the receiver would
     // fall behind until the socket buffer overflowed — measured as loss.
     let direction = params.direction;
+    // Only a protocol-1 server sends the receiver summary; waiting for one from
+    // an older server would just stretch the test by the wait.
+    let sends_summary = server_version >= 1;
     let send_task = (params.direction != Direction::Rx).then(|| {
         let (sock, stop, tx) = (sock.clone(), stop.clone(), tx.clone());
         let cfg = udp::TxConfig {
@@ -235,6 +264,7 @@ async fn run_udp_stream(
             // server's tally of its flow here (in Bidir the receive task does).
             // The report goes out before "finished", which ends the test.
             if direction == Direction::Tx
+                && sends_summary
                 && let Some(peer) = udp::await_peer_summary(&sock, udp::SUMMARY_WAIT).await
             {
                 send_udp_report(&tx, stream_index, Flow::Tx, &peer);
@@ -252,7 +282,7 @@ async fn run_udp_stream(
                 max_wait,
                 report_every,
                 reack: None,
-                expect_peer_summary: direction == Direction::Bidir,
+                expect_peer_summary: direction == Direction::Bidir && sends_summary,
             };
             let outcome = udp::rx_loop(&sock, start, &stop, cfg, |report, quality| {
                 send_udp_rx_interval(&tx, stream_index, report, quality)

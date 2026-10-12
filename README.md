@@ -75,7 +75,7 @@ TCP · UDP · QUIC &nbsp;|&nbsp; TX / RX / bidirectional &nbsp;|&nbsp; real loss
   - [Files gauge writes](#files-gauge-writes)
 - [Security notes](#security-notes)
 - [Troubleshooting](#troubleshooting)
-- [Architecture](#architecture)
+- [Architecture](#architecture) · [Wire protocol](docs/protocol.md) · [Stability policy](docs/stability.md)
 - [Development](#development)
 - [Limitations](#limitations)
 - [Contributing](#contributing) · [Changelog](CHANGELOG.md)
@@ -320,7 +320,7 @@ gauge is a measurement tool, not a hardened service. Know what it does and does 
 - **No authentication.** Any host that can reach a running `gauge server` can start a test against it and use its bandwidth. Bind to a specific interface (`--bind`) or firewall the port on untrusted networks, and stop the server when you are done.
 - **TCP and UDP tests are unencrypted.**
 - **QUIC is encrypted but the server is not authenticated.** The server generates a throw-away self-signed certificate on every start, and the client deliberately does not verify it. A QUIC test measures the transport; it does not prove you reached the right server.
-- Input from the network (handshake fields such as the report interval) is validated and clamped.
+- Input from the network is validated: handshake messages are capped at 64 KiB, fields such as the report interval are clamped, and a client speaking a newer protocol than the server is refused with a clear message. The full list of limits (and what is *not* bounded, such as the test duration a client may ask for) is in [docs/protocol.md](docs/protocol.md#limits-and-untrusted-input).
 
 ## Troubleshooting
 
@@ -348,7 +348,7 @@ src/
   util.rs  theme.rs
   net/
     mod.rs       background Tokio runtime + command/event channel to the sync UI
-    protocol.rs  handshake framing (length-prefixed JSON for TCP/QUIC, datagrams for UDP)
+    protocol.rs  handshake framing + protocol version (length-prefixed JSON for TCP/QUIC, datagrams for UDP)
     duplex.rs    shared stream read/write loops, interval reporting, per-direction driver
     client.rs    connects and runs a test; TCP and UDP clients
     server.rs    accepts tests; TCP server and UDP server (one socket + task per stream)
@@ -361,6 +361,9 @@ src/
   ui/            Ratatui screens: live, config, history, server (+ shared widgets)
 tests/
   tui_pty.rs     end-to-end tests driving the real binary through a PTY
+docs/
+  protocol.md    the wire protocol, version 1 (handshake, TCP, QUIC, UDP, limits)
+  stability.md   what is stable across releases (applies from 1.0.0)
 ```
 
 The network engine runs on its own OS thread hosting a Tokio runtime, fully decoupled from the synchronous Ratatui render loop: `NetCommand`s go in, `NetEvent`s come out over plain channels. The CLI drives the same channels with blocking receives. TCP and QUIC share one set of read/write loops (`duplex.rs`); only the handshake and socket setup differ.
@@ -378,7 +381,7 @@ just linux                           # the same lints + tests in a Linux contain
 
 CI (`.github/workflows/ci.yml`) checks formatting (`cargo fmt --check`) and the dependency policy (`cargo deny`: licenses, sources, RustSec advisories), then runs clippy with `-D warnings`, the full test suite and a release build on **Linux and macOS**. Dependabot proposes weekly dependency and action updates. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
-**168 tests**, in four layers:
+**179 tests**, in four layers:
 
 | Layer | What it checks |
 |---|---|
@@ -391,7 +394,7 @@ Tests never touch your real config, history or log: those paths are stubbed in u
 
 ## Limitations
 
-- **Not wire-compatible with iperf3** (see the note at the top).
+- **Not wire-compatible with iperf3** (see the note at the top). gauge's own protocol is [documented](docs/protocol.md) and versioned; a newer client is refused by an older server with a message saying so, and an older client works with a newer server.
 - **Linux and macOS only.** The code uses Unix file descriptors and socket options directly.
 - **TCP congestion control per socket is Linux-only**; QUIC offers it on every platform.
 - **No MTU control for TCP** — there is no portable socket option for it.
