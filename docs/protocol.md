@@ -82,7 +82,7 @@ Sent by the client first, as a JSON object. Fields:
 | `stream_index` | u8 | yes | This stream's position, `0 … stream_count − 1`. |
 | `stream_count` | u8 | yes | How many streams the test has. |
 | `direction` | `"Tx"` \| `"Rx"` \| `"Bidir"` | yes | **From the client's point of view**: `Tx` = the client sends, `Rx` = the server sends, `Bidir` = both. |
-| `chunk_bytes` | u32 \| null | no (absent = null) | Size of each write/read call for TCP/QUIC (the "buffer size"). `null` = 128 KiB. |
+| `chunk_bytes` | u32 \| null | no (absent = null) | Size of each write/read call for TCP/QUIC (the "buffer size"). `null` = 128 KiB. A server caps it at 16 MiB. |
 | `tos` | u8 \| null | no (absent = null) | IP TOS / DSCP byte the client marks its packets with; the server applies it to its own sends. `0`/`null` = leave the OS default. |
 | `congestion` | string \| null | no | TCP congestion-control algorithm the client chose; the server applies it best-effort to its own sending side. |
 | `bandwidth_bps` | u64 \| null | no | UDP: the per-stream target rate. The server paces its own sends (Rx/Bidir) the same way. `null` = unthrottled. |
@@ -284,6 +284,7 @@ Everything a peer sends is untrusted. What an implementation must bound:
 |---|---|
 | Handshake / ack length (TCP, QUIC) | 65 536 bytes; larger is refused without allocating |
 | `interval_secs` | clamped to 1 … 60 |
+| `chunk_bytes` | the server uses 1 byte … 16 MiB, whatever the client asks for |
 | `duration_secs` | at least 1; **no upper bound is enforced** — a client can ask a server to send or receive for as long as it stays connected |
 | UDP datagram size | received buffers are 64 KiB; the sender's packet size is clamped to 64 … 65000 |
 | Parallel streams | `stream_count` is a `u8`; the server places no further cap on how many streams or sessions it serves |

@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `--tcp` and `--tx` (client) and `--tcp` (server): an explicit flag for every
+  transport and direction, so a default in the config file can always be
+  overridden from the command line.
+
+### Fixed
+
+- **A saved profile could not be overridden.** The Config screen's default
+  direction is bidirectional, so `Ctrl+S` wrote `bidir = true` — after which
+  every `gauge client` ran bidirectionally and `-R` had no effect. A direction
+  or transport flag now always beats the config file.
+- A saved **TX-only profile reloaded as bidirectional** in the TUI.
+- **UDP over IPv6** failed to connect (`Invalid argument`): the client always
+  created an IPv4 socket. TCP, UDP and QUIC are now all tested over `::1`.
+
+### Security
+
+- Updated `rustls` to 0.23.46, which fixes four advisories (RUSTSEC-2026-0346 to
+  -0349: TLS secrets in `Debug` output, data buffered after an ECH rejection,
+  a Brotli decompression allocation, and a key-exchange downgrade). They
+  affect the TLS stack behind QUIC.
+- A server no longer allocates a write buffer of whatever size a peer asks for
+  (up to 4 GiB): `chunk_bytes` is capped at 16 MiB on the server.
+
+### Changed
+
+- Added a test that throws garbage and malformed handshakes at the TCP, UDP and
+  QUIC servers and checks that they keep serving afterwards.
+
 ## [0.2.0] - 2026-10-12
 
 UDP measurements you can trust, a documented and versioned wire protocol, and

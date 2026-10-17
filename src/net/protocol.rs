@@ -78,7 +78,17 @@ pub struct Handshake {
     pub interval_secs: Option<u64>,
 }
 
+/// The largest write/read buffer a server will allocate on a peer's say-so.
+/// The client's own `--buffer` is not limited (it is the user's machine).
+pub const MAX_CHUNK_BYTES: usize = 16 * 1024 * 1024;
+
 impl Handshake {
+    /// The write/read chunk size to use, bounded — it is untrusted input and
+    /// would otherwise let a peer make the server allocate up to 4 GiB.
+    pub fn chunk_size(&self) -> usize {
+        self.chunk_bytes.map_or(super::duplex::CHUNK, |b| (b as usize).clamp(1, MAX_CHUNK_BYTES))
+    }
+
     /// The report interval to use, clamped — a handshake is untrusted input.
     pub fn report_every(&self) -> std::time::Duration {
         std::time::Duration::from_secs(self.interval_secs.unwrap_or(1).clamp(1, 60))
@@ -239,6 +249,19 @@ mod tests {
         let garbage = [0u8, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
         let result: serde_json::Result<Handshake> = decode_datagram(&garbage);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn a_peer_cannot_make_the_server_allocate_a_huge_buffer() {
+        let mut hs = sample_handshake();
+        hs.chunk_bytes = None;
+        assert_eq!(hs.chunk_size(), super::super::duplex::CHUNK);
+        hs.chunk_bytes = Some(0);
+        assert_eq!(hs.chunk_size(), 1);
+        hs.chunk_bytes = Some(64 * 1024);
+        assert_eq!(hs.chunk_size(), 64 * 1024);
+        hs.chunk_bytes = Some(u32::MAX);
+        assert_eq!(hs.chunk_size(), MAX_CHUNK_BYTES);
     }
 
     #[test]

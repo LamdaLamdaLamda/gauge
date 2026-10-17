@@ -150,7 +150,7 @@ async fn handle_tcp_client(mut stream: TcpStream, addr: String, tx: UnboundedSen
     let start = Instant::now();
     let duration = Duration::from_secs(handshake.duration_secs.max(1));
     let fd = stream.as_raw_fd();
-    let chunk_bytes = handshake.chunk_bytes.map(|b| b as usize).unwrap_or(duplex::CHUNK);
+    let chunk_bytes = handshake.chunk_size();
     let report_every = handshake.report_every();
 
     let (mut rh, mut wh) = stream.split();

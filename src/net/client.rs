@@ -169,14 +169,29 @@ async fn run_udp_stream(
     tx: UnboundedSender<NetEvent>,
 ) {
     let addr = format!("{}:{}", params.host, params.port);
-    let sock = match UdpSocket::bind("0.0.0.0:0").await {
+    // Resolve first: the socket's address family has to match the server's, or
+    // `connect` fails (an IPv4 socket cannot reach an IPv6 address).
+    let target = match tokio::net::lookup_host(&addr).await.map(|mut a| a.next()) {
+        Ok(Some(a)) => a,
+        Ok(None) => {
+            let _ = tx.send(err(stream_index, format!("udp connect to {addr} failed: no address")));
+            return;
+        }
+        Err(e) => {
+            let _ = tx.send(err(stream_index, format!("udp connect to {addr} failed: {e}")));
+            return;
+        }
+    };
+    let local: std::net::SocketAddr =
+        if target.is_ipv6() { ([0u16; 8], 0).into() } else { ([0, 0, 0, 0], 0).into() };
+    let sock = match UdpSocket::bind(local).await {
         Ok(s) => s,
         Err(e) => {
             let _ = tx.send(err(stream_index, format!("udp bind failed: {e}")));
             return;
         }
     };
-    if let Err(e) = sock.connect(&addr).await {
+    if let Err(e) = sock.connect(target).await {
         let _ = tx.send(err(stream_index, format!("udp connect to {addr} failed: {e}")));
         return;
     }

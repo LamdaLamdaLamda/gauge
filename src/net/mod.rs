@@ -585,7 +585,9 @@ mod tests {
             proto: Proto::Udp,
             stream_count: 1,
             direction: Direction::Tx,
-            bandwidth_bps: None,
+            // Paced, so the receiver keeps up and the packet count is exact
+            // (an unthrottled burst of 548-byte packets drops its tail).
+            bandwidth_bps: Some(20_000_000),
             window_bytes: None,
             mtu: 576, // small MTU -> small packets, well under the old hardcoded 1200
             buffer_bytes: None,
@@ -1768,5 +1770,181 @@ mod tests {
         assert!(client::require_server_version(&params(true), 1).is_ok());
         // Every other test works against any server.
         assert!(client::require_server_version(&params(false), 0).is_ok());
+    }
+
+    // ── IPv6 ────────────────────────────────────────────────────────────
+
+    /// Whether this machine can use `::1` (containers and CI runners often
+    /// have IPv6 switched off); the IPv6 tests skip themselves if not.
+    fn ipv6_loopback_available() -> bool {
+        std::net::UdpSocket::bind("[::1]:0").is_ok()
+            && std::net::TcpListener::bind("[::1]:0").is_ok()
+    }
+
+    async fn spawn_server_on(bind: &str, proto: Proto) -> (UnboundedReceiver<NetEvent>, u16) {
+        let (tx, mut rx) = unbounded_channel::<NetEvent>();
+        let params = ServerParams { bind: bind.into(), port: 0, proto, window_bytes: None };
+        match proto {
+            Proto::Tcp => tokio::spawn(server::run_tcp(params, tx)),
+            Proto::Udp => tokio::spawn(server::run_udp(params, tx)),
+            Proto::Quic => tokio::spawn(quic::run_server(params, tx)),
+        };
+        match recv(&mut rx).await {
+            NetEvent::ServerListening { bind } => {
+                (rx, bind.rsplit(':').next().unwrap().parse().unwrap())
+            }
+            other => panic!("expected ServerListening on {bind}, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn every_transport_works_over_ipv6() {
+        if !ipv6_loopback_available() {
+            eprintln!("skipping: this machine has no IPv6 loopback");
+            return;
+        }
+        for proto in [Proto::Tcp, Proto::Udp, Proto::Quic] {
+            let (_server_rx, port) = spawn_server_on("::1", proto).await;
+            let (client_tx, mut client_rx) = unbounded_channel::<NetEvent>();
+            let params = ClientParams {
+                host: "::1".into(),
+                proto,
+                bandwidth_bps: (proto == Proto::Udp).then_some(50_000_000),
+                ..tcp_params(port, 1)
+            };
+            tokio::spawn(client::run_stream(
+                params,
+                0,
+                Arc::new(AtomicBool::new(false)),
+                client_tx,
+            ));
+            loop {
+                match recv(&mut client_rx).await {
+                    NetEvent::ClientStreamFinished { total_bytes, .. } => {
+                        assert!(total_bytes > 0, "{proto:?} over IPv6 moved no data");
+                        break;
+                    }
+                    NetEvent::ClientError { message, .. } => {
+                        panic!("{proto:?} over IPv6 failed: {message}")
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn udp_reverse_and_the_receiver_report_work_over_ipv6() {
+        if !ipv6_loopback_available() {
+            eprintln!("skipping: this machine has no IPv6 loopback");
+            return;
+        }
+        let (_server_rx, port) = spawn_server_on("::1", Proto::Udp).await;
+        let (client_tx, mut client_rx) = unbounded_channel::<NetEvent>();
+        let params = ClientParams {
+            host: "::1".into(),
+            proto: Proto::Udp,
+            direction: Direction::Bidir,
+            bandwidth_bps: Some(50_000_000),
+            ..tcp_params(port, 1)
+        };
+        tokio::spawn(client::run_stream(params, 0, Arc::new(AtomicBool::new(false)), client_tx));
+        let (mut reports, mut finished) = (0, 0);
+        while finished < 2 {
+            match recv(&mut client_rx).await {
+                NetEvent::ClientUdpReport { received, .. } => {
+                    assert!(received > 0);
+                    reports += 1;
+                }
+                NetEvent::ClientStreamFinished { .. } => finished += 1,
+                NetEvent::ClientError { message, .. } => panic!("IPv6 UDP bidir failed: {message}"),
+                _ => {}
+            }
+        }
+        assert_eq!(reports, 2, "one report per direction");
+    }
+
+    // ── hostile input ───────────────────────────────────────────────────
+
+    /// Cheap deterministic pseudo-random bytes (no extra dependency, and a
+    /// failure can be reproduced from the seed).
+    fn junk(seed: u64, len: usize) -> Vec<u8> {
+        let mut x = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        (0..len)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                (x >> 24) as u8
+            })
+            .collect()
+    }
+
+    /// Runs a normal short test and asserts it still works.
+    async fn assert_server_still_serves(proto: Proto, port: u16) {
+        let (client_tx, mut client_rx) = unbounded_channel::<NetEvent>();
+        let params = ClientParams {
+            proto,
+            bandwidth_bps: (proto == Proto::Udp).then_some(20_000_000),
+            ..tcp_params(port, 1)
+        };
+        tokio::spawn(client::run_stream(params, 0, Arc::new(AtomicBool::new(false)), client_tx));
+        loop {
+            match recv(&mut client_rx).await {
+                NetEvent::ClientStreamFinished { total_bytes, .. } => {
+                    assert!(total_bytes > 0);
+                    return;
+                }
+                NetEvent::ClientError { message, .. } => {
+                    panic!("{proto:?} server no longer works after hostile input: {message}")
+                }
+                _ => {}
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn servers_survive_garbage_and_malformed_handshakes() {
+        use tokio::io::AsyncWriteExt;
+
+        let malformed: Vec<Vec<u8>> = vec![
+            junk(1, 1),
+            junk(2, 100),
+            junk(3, 4000),
+            br#"{"foo":1}"#.to_vec(),                // valid JSON, wrong shape
+            br#"{"duration_secs":"ten"}"#.to_vec(),  // right field, wrong type
+            br#"{"direction":"Sideways","duration_secs":1,"session_id":1,"stream_index":0,"stream_count":1,"chunk_bytes":null}"#.to_vec(),
+            br#"{"duration_secs":1,"session_id":1,"stream_index":0,"stream_count":1,"direction":"Tx","chunk_bytes":0}"#.to_vec(),
+            Vec::new(),
+        ];
+
+        // TCP: each as a length-prefixed message, then a raw dump, then a hang-up mid-message.
+        let (_rx, tcp_port) = spawn_server(Proto::Tcp).await;
+        for body in &malformed {
+            let mut c = tokio::net::TcpStream::connect(("127.0.0.1", tcp_port)).await.unwrap();
+            let _ = c.write_all(&(body.len() as u32).to_be_bytes()).await;
+            let _ = c.write_all(body).await;
+            drop(c);
+            let mut c = tokio::net::TcpStream::connect(("127.0.0.1", tcp_port)).await.unwrap();
+            let _ = c.write_all(body).await; // no length prefix at all
+            drop(c);
+        }
+        let mut c = tokio::net::TcpStream::connect(("127.0.0.1", tcp_port)).await.unwrap();
+        let _ = c.write_all(&1000u32.to_be_bytes()).await; // promises 1000 bytes, sends none
+        drop(c);
+        assert_server_still_serves(Proto::Tcp, tcp_port).await;
+
+        // UDP and QUIC: the same bytes as bare datagrams, plus data-shaped garbage.
+        for proto in [Proto::Udp, Proto::Quic] {
+            let (_rx, port) = spawn_server(proto).await;
+            let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            for body in malformed.iter().chain([&junk(9, 16), &junk(10, 1472), &junk(11, 9000)]) {
+                let _ = sock.send_to(body, ("127.0.0.1", port)).await;
+            }
+            let mut fin = vec![0u8; 16];
+            fin[..8].copy_from_slice(&u64::MAX.to_be_bytes());
+            let _ = sock.send_to(&fin, ("127.0.0.1", port)).await; // a FIN from nowhere
+            assert_server_still_serves(proto, port).await;
+        }
     }
 }
