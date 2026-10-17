@@ -583,6 +583,10 @@ impl ConfigState {
         self.direction = match (d.bidir, d.reverse) {
             (Some(true), _) => 0,
             (_, Some(true)) => 2,
+            // A saved profile that says "neither" is a plain TX test; leaving
+            // the screen's own default (bidir) in place would silently turn a
+            // saved TX profile into a bidirectional one on the next start.
+            (Some(false), Some(false)) => 1,
             _ => self.direction,
         };
         if let Some(v) = &d.bandwidth {
@@ -2044,6 +2048,22 @@ mod tests {
         assert!(preview.contains("--interval 5"), "{preview}");
         assert!(preview.contains("--tos 0xb8"), "{preview}");
         assert!(preview.contains("--congestion bbr"), "{preview}");
+    }
+
+    #[test]
+    fn a_saved_direction_comes_back_as_saved_including_plain_tx() {
+        // Before: a saved TX profile (bidir=false, reverse=false) reloaded as
+        // bidirectional, because "neither" left the screen's default in place.
+        for (direction, name) in [(0usize, "bidir"), (1, "tx"), (2, "reverse")] {
+            let mut saved = ConfigState::default();
+            saved.direction = direction;
+            let defaults = saved.to_defaults();
+
+            let mut restored = ConfigState::default();
+            restored.direction = 2; // start from something else
+            restored.apply_defaults(&defaults);
+            assert_eq!(restored.direction, direction, "{name} must survive a save/load");
+        }
     }
 
     #[test]

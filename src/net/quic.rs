@@ -355,7 +355,7 @@ async fn serve_conn(
         start: Instant::now(),
         stop: &stop,
         stats: duplex::StatsSource::Quic(conn.clone()),
-        chunk_bytes: handshake.chunk_bytes.map(|b| b as usize).unwrap_or(duplex::CHUNK),
+        chunk_bytes: handshake.chunk_size(),
         report_every: handshake.report_every(),
     };
     duplex::run_direction(

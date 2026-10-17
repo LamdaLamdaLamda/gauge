@@ -161,8 +161,10 @@ Options:
   -p, --port <PORT>              Server port. [default: 5201]
   -t, --duration <DURATION>      Test duration in seconds. [default: 10]
   -P, --parallel <PARALLEL>      Number of parallel streams. [default: 1]
+      --tcp                      Use TCP (the default); overrides a UDP/QUIC default from the config
   -u, --udp                      Use UDP instead of TCP
       --quic                     Use QUIC (encrypted, over UDP) instead of TCP
+      --tx                       Client sends (the default); overrides a reverse/bidir default from the config
   -R, --reverse                  Server sends, client receives
       --bidir                    Both directions at once, over the same connection
   -b, --bandwidth <BANDWIDTH>    UDP target bitrate, e.g. "100M" or "1G" (unthrottled if omitted); "auto" searches for the highest loss-free rate
@@ -181,6 +183,7 @@ Usage: gauge server [OPTIONS]
 Options:
       --bind <BIND>      Address to bind to [default: 0.0.0.0]
   -p, --port <PORT>      Port to listen on [default: 5201]
+      --tcp              Accept TCP tests (the default); overrides a UDP/QUIC default from the config
   -u, --udp              Accept UDP tests instead of TCP
       --quic             Accept QUIC tests instead of TCP (self-signed certificate)
       --window <WINDOW>  TCP socket buffer / QUIC flow-control window / UDP socket buffers [default: 256K]
@@ -298,7 +301,7 @@ port = 5555
 window = "512K"
 ```
 
-Precedence for every setting: **command-line flag > config file > built-in default.** The on/off flags (`--udp`, `--quic`, `--reverse`, `--bidir`, `--omit`, `--json`, `--one-off`) are the one exception: they OR together with the file, since there is no `--no-udp`.
+Precedence for every setting: **command-line flag > config file > built-in default.** Transport and direction each have an explicit flag for every choice — `--tcp` / `--udp` / `--quic` and `--tx` / `--reverse` / `--bidir` — so a default saved in the file can always be overridden from the command line (e.g. `gauge client --tx` against a saved `bidir = true`). The plain on/off switches (`--omit`, `--json`, `--one-off`) are the one exception: they OR together with the file.
 
 `Ctrl+S` on the Config or Server Mode screen writes the screen's current values into the matching section (keeping the other one intact), so the TUI and the CLI share one set of defaults.
 
@@ -381,7 +384,7 @@ just linux                           # the same lints + tests in a Linux contain
 
 CI (`.github/workflows/ci.yml`) checks formatting (`cargo fmt --check`) and the dependency policy (`cargo deny`: licenses, sources, RustSec advisories), then runs clippy with `-D warnings`, the full test suite and a release build on **Linux and macOS**. Dependabot proposes weekly dependency and action updates. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
-**179 tests**, in four layers:
+**189 tests**, in four layers:
 
 | Layer | What it checks |
 |---|---|

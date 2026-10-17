@@ -43,10 +43,11 @@ pub enum Command {
 /// `default_value` — an absent flag falls through to the config file
 /// (`~/.config/gauge/config.toml`'s `[client]` section, or wherever
 /// `dirs::config_dir()` points; see `crate::config`) and only then to the
-/// hardcoded fallback noted in each doc comment. The on/off flags
-/// (`--udp`/`--reverse`/`--bidir`/`--json`) OR together with the config
-/// file's value — the config file can turn one on by default, but there's
-/// no `--no-udp` to force it back off from the command line.
+/// hardcoded fallback noted in each doc comment. Transport and direction are
+/// each chosen by **one** explicit flag that always beats the config file
+/// (`--tcp`/`--udp`/`--quic`, `--tx`/`--reverse`/`--bidir`), so a default saved
+/// in the config can be overridden either way; the plain on/off switches
+/// (`--omit`, `--json`, `--one-off`) still OR together with the file's value.
 #[derive(Args)]
 pub struct ClientArgs {
     /// Server host or IP to connect to. [config default: client.host,
@@ -64,6 +65,10 @@ pub struct ClientArgs {
     /// otherwise 1]
     #[arg(short = 'P', long)]
     parallel: Option<u8>,
+    /// Use TCP (the default). Only needed to override a UDP or QUIC default
+    /// from the config file.
+    #[arg(long, conflicts_with_all = ["udp", "quic"])]
+    tcp: bool,
     /// Use UDP instead of TCP.
     #[arg(short, long, conflicts_with = "quic")]
     udp: bool,
@@ -73,6 +78,10 @@ pub struct ClientArgs {
     /// every platform) and --tos; --bandwidth and --mtu don't apply.
     #[arg(long)]
     quic: bool,
+    /// The client sends (the default). Only needed to override a reverse or
+    /// bidirectional default from the config file.
+    #[arg(long, conflicts_with_all = ["reverse", "bidir"])]
+    tx: bool,
     /// Reverse the direction: server sends, client receives.
     #[arg(short = 'R', long, conflicts_with = "bidir")]
     reverse: bool,
@@ -141,6 +150,10 @@ pub struct ServerArgs {
     /// Port to listen on. [config default: server.port, otherwise 5201]
     #[arg(short, long)]
     port: Option<u16>,
+    /// Accept TCP tests (the default). Only needed to override a UDP or QUIC
+    /// default from the config file.
+    #[arg(long, conflicts_with_all = ["udp", "quic"])]
+    tcp: bool,
     /// Accept UDP tests instead of TCP.
     #[arg(short, long, conflicts_with = "quic")]
     udp: bool,
@@ -195,6 +208,63 @@ fn watch_ctrlc_hard() {
     });
 }
 
+/// The transport flags given on the command line.
+#[derive(Clone, Copy, Default)]
+struct TransportFlags {
+    tcp: bool,
+    udp: bool,
+    quic: bool,
+}
+
+/// The direction flags given on the command line.
+#[derive(Clone, Copy, Default)]
+struct DirectionFlags {
+    tx: bool,
+    reverse: bool,
+    bidir: bool,
+}
+
+/// An explicit command-line flag always wins over the config file; with no
+/// flag the config decides (QUIC before UDP before TCP). Without this, a
+/// default saved from the Config screen could not be overridden: there was
+/// no flag to switch it back off.
+fn resolve_proto(flags: TransportFlags, cfg_udp: Option<bool>, cfg_quic: Option<bool>) -> Proto {
+    if flags.quic {
+        Proto::Quic
+    } else if flags.udp {
+        Proto::Udp
+    } else if flags.tcp {
+        Proto::Tcp
+    } else if cfg_quic == Some(true) {
+        Proto::Quic
+    } else if cfg_udp == Some(true) {
+        Proto::Udp
+    } else {
+        Proto::Tcp
+    }
+}
+
+/// Same rule for the direction: a flag beats the config's `bidir`/`reverse`.
+fn resolve_direction(
+    flags: DirectionFlags,
+    cfg_reverse: Option<bool>,
+    cfg_bidir: Option<bool>,
+) -> Direction {
+    if flags.bidir {
+        Direction::Bidir
+    } else if flags.reverse {
+        Direction::Rx
+    } else if flags.tx {
+        Direction::Tx
+    } else if cfg_bidir == Some(true) {
+        Direction::Bidir
+    } else if cfg_reverse == Some(true) {
+        Direction::Rx
+    } else {
+        Direction::Tx
+    }
+}
+
 pub fn run_client(args: ClientArgs) -> i32 {
     // Merge order: explicit CLI flag > config file > hardcoded fallback.
     // See `ClientArgs`'s doc comment for the on/off-flag OR-merge caveat.
@@ -203,10 +273,17 @@ pub fn run_client(args: ClientArgs) -> i32 {
     let port = args.port.or(cfg.port).unwrap_or(5201);
     let duration = args.duration.or(cfg.duration_secs).unwrap_or(10);
     let parallel = args.parallel.or(cfg.parallel).unwrap_or(1);
-    let udp = args.udp || cfg.udp.unwrap_or(false);
-    let quic = args.quic || cfg.quic.unwrap_or(false);
-    let reverse = args.reverse || cfg.reverse.unwrap_or(false);
-    let bidir = args.bidir || cfg.bidir.unwrap_or(false);
+    let proto = resolve_proto(
+        TransportFlags { tcp: args.tcp, udp: args.udp, quic: args.quic },
+        cfg.udp,
+        cfg.quic,
+    );
+    let (udp, quic) = (proto == Proto::Udp, proto == Proto::Quic);
+    let direction = resolve_direction(
+        DirectionFlags { tx: args.tx, reverse: args.reverse, bidir: args.bidir },
+        cfg.reverse,
+        cfg.bidir,
+    );
     let bandwidth = args.bandwidth.or(cfg.bandwidth);
     let window = args.window.or(cfg.window).unwrap_or_else(|| "256K".into());
     let mtu = args.mtu.or(cfg.mtu).unwrap_or(9000);
@@ -241,24 +318,10 @@ pub fn run_client(args: ClientArgs) -> i32 {
         return 1;
     }
 
-    let proto = if quic {
-        Proto::Quic
-    } else if udp {
-        Proto::Udp
-    } else {
-        Proto::Tcp
-    };
     let proto_label = match proto {
         Proto::Tcp => "TCP",
         Proto::Udp => "UDP",
         Proto::Quic => "QUIC",
-    };
-    let direction = if bidir {
-        Direction::Bidir
-    } else if reverse {
-        Direction::Rx
-    } else {
-        Direction::Tx
     };
     let dir_label = match direction {
         Direction::Tx => "TX",
@@ -643,19 +706,15 @@ pub fn run_server(args: ServerArgs) -> i32 {
     let cfg = config::load().server;
     let bind = args.bind.or(cfg.bind).unwrap_or_else(|| "0.0.0.0".into());
     let port = args.port.or(cfg.port).unwrap_or(5201);
-    let udp = args.udp || cfg.udp.unwrap_or(false);
-    let quic = args.quic || cfg.quic.unwrap_or(false);
+    let proto = resolve_proto(
+        TransportFlags { tcp: args.tcp, udp: args.udp, quic: args.quic },
+        cfg.udp,
+        cfg.quic,
+    );
     let window = args.window.or(cfg.window).unwrap_or_else(|| "256K".into());
     let json = args.json || cfg.json.unwrap_or(false);
     let one_off = args.one_off || cfg.one_off.unwrap_or(false);
 
-    let proto = if quic {
-        Proto::Quic
-    } else if udp {
-        Proto::Udp
-    } else {
-        Proto::Tcp
-    };
     let proto_label = match proto {
         Proto::Tcp => "TCP",
         Proto::Udp => "UDP",
@@ -782,4 +841,87 @@ pub fn run_server(args: ServerArgs) -> i32 {
         }
     }
     0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn t(tcp: bool, udp: bool, quic: bool) -> TransportFlags {
+        TransportFlags { tcp, udp, quic }
+    }
+
+    fn d(tx: bool, reverse: bool, bidir: bool) -> DirectionFlags {
+        DirectionFlags { tx, reverse, bidir }
+    }
+
+    #[test]
+    fn a_direction_flag_beats_whatever_the_config_file_saved() {
+        // The trap this fixes: Ctrl+S in the TUI saves `bidir = true`, and then
+        // `-R` used to do nothing because bidir was checked first.
+        let saved_bidir = (Some(false), Some(true)); // (reverse, bidir)
+        assert_eq!(
+            resolve_direction(d(false, true, false), saved_bidir.0, saved_bidir.1),
+            Direction::Rx
+        );
+        assert_eq!(
+            resolve_direction(d(true, false, false), saved_bidir.0, saved_bidir.1),
+            Direction::Tx
+        );
+        assert_eq!(
+            resolve_direction(d(false, false, true), Some(true), Some(false)),
+            Direction::Bidir
+        );
+        // …and the other way round.
+        assert_eq!(
+            resolve_direction(d(true, false, false), Some(true), Some(false)),
+            Direction::Tx
+        );
+    }
+
+    #[test]
+    fn with_no_direction_flag_the_config_decides_and_tx_is_the_fallback() {
+        assert_eq!(resolve_direction(d(false, false, false), None, None), Direction::Tx);
+        assert_eq!(
+            resolve_direction(d(false, false, false), Some(false), Some(false)),
+            Direction::Tx
+        );
+        assert_eq!(resolve_direction(d(false, false, false), Some(true), None), Direction::Rx);
+        assert_eq!(resolve_direction(d(false, false, false), None, Some(true)), Direction::Bidir);
+    }
+
+    #[test]
+    fn a_transport_flag_beats_the_config_file_too() {
+        assert_eq!(resolve_proto(t(true, false, false), Some(true), Some(false)), Proto::Tcp);
+        assert_eq!(resolve_proto(t(false, true, false), None, Some(true)), Proto::Udp);
+        assert_eq!(resolve_proto(t(false, false, true), Some(true), None), Proto::Quic);
+    }
+
+    #[test]
+    fn with_no_transport_flag_the_config_decides_and_tcp_is_the_fallback() {
+        assert_eq!(resolve_proto(t(false, false, false), None, None), Proto::Tcp);
+        assert_eq!(resolve_proto(t(false, false, false), Some(true), None), Proto::Udp);
+        assert_eq!(resolve_proto(t(false, false, false), Some(true), Some(true)), Proto::Quic);
+    }
+
+    #[test]
+    fn contradictory_flags_are_rejected_by_the_parser() {
+        use clap::Parser;
+        for args in [
+            ["gauge", "client", "--tx", "--reverse"],
+            ["gauge", "client", "--tx", "--bidir"],
+            ["gauge", "client", "--tcp", "--udp"],
+            ["gauge", "client", "--tcp", "--quic"],
+            ["gauge", "server", "--tcp", "--udp"],
+        ] {
+            assert!(Cli::try_parse_from(args).is_err(), "{args:?} must conflict");
+        }
+        for args in [
+            ["gauge", "client", "--tx", "--udp"],
+            ["gauge", "client", "--tcp", "--bidir"],
+            ["gauge", "server", "--tcp", "--one-off"],
+        ] {
+            assert!(Cli::try_parse_from(args).is_ok(), "{args:?} is a valid combination");
+        }
+    }
 }
