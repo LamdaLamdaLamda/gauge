@@ -287,4 +287,11 @@ For maintainers:
    add a fresh empty `[Unreleased]` section above it.
 4. Run `cargo build --release` and do a short real-network test with the
    release binary.
-5. Commit, tag (`vX.Y.Z`) and push the tag.
+5. Commit the release (`chore(release): release version X.Y.Z …`), open a pull
+   request and merge it. **Tag the merge commit on `main`**, after the merge —
+   the tag must point at a commit whose `Cargo.toml` already says the new
+   version (check with `gauge --version` from that commit):
+   `git tag -s vX.Y.Z -m "gauge X.Y.Z" && git push origin vX.Y.Z`.
+6. Create the GitHub release from the tag, with the `CHANGELOG.md` section as
+   its notes. `gauge` is not published to crates.io (`publish = false` in
+   `Cargo.toml`).

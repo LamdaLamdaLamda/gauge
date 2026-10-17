@@ -2,13 +2,14 @@
 
 ## Supported versions
 
-gauge is pre-1.0 and has no long-term-support branches. Security fixes go into
-the latest release only.
+gauge has no long-term-support branches. Security fixes go into the latest
+release of the current major version (1.x) only; upgrading within 1.x is meant
+to be painless (see [docs/stability.md](docs/stability.md)).
 
 | Version | Supported |
 |---|---|
-| latest `0.x` release | ✅ |
-| anything older | ❌ |
+| latest `1.x` release | ✅ |
+| `0.x` and older `1.x` releases | ❌ |
 
 ## What gauge is — and isn't
 

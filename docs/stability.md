@@ -2,8 +2,8 @@
 
 gauge follows [Semantic Versioning](https://semver.org/). This page says what
 that means in practice: what you can rely on across releases, and what you
-can't. **It applies from 1.0.0 on.** Before that (0.x) anything may still
-change in a minor release, though the changelog will say so.
+can't. **It has been in effect since 1.0.0.** (Releases before that, 0.x, made
+no such promise.)
 
 ## What is stable
 

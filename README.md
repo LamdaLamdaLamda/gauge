@@ -9,7 +9,7 @@ TCP · UDP · QUIC &nbsp;|&nbsp; TX / RX / bidirectional &nbsp;|&nbsp; real loss
 ![Rust 1.88+](https://img.shields.io/badge/rust-1.88%2B-orange)
 ![License: MIT](https://img.shields.io/badge/license-MIT-green)
 ![Platforms](https://img.shields.io/badge/platforms-Linux%20%7C%20macOS-blue)
-![Status](https://img.shields.io/badge/status-0.2.0-lightgrey)
+![Status](https://img.shields.io/badge/status-1.0.0-brightgreen)
 
 </div>
 
@@ -366,7 +366,7 @@ tests/
   tui_pty.rs     end-to-end tests driving the real binary through a PTY
 docs/
   protocol.md    the wire protocol, version 1 (handshake, TCP, QUIC, UDP, limits)
-  stability.md   what is stable across releases (applies from 1.0.0)
+  stability.md   what is stable across releases
 ```
 
 The network engine runs on its own OS thread hosting a Tokio runtime, fully decoupled from the synchronous Ratatui render loop: `NetCommand`s go in, `NetEvent`s come out over plain channels. The CLI drives the same channels with blocking receives. TCP and QUIC share one set of read/write loops (`duplex.rs`); only the handshake and socket setup differ.

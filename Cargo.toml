@@ -1,9 +1,12 @@
 [package]
 name = "gauge"
-version = "0.2.0"
+version = "1.0.0"
 edition = "2024"
 rust-version = "1.88"
 license = "MIT"
+# Not published to crates.io (the name `gauge` is taken, and distribution is via
+# GitHub releases for now). Remove this line if that changes.
+publish = false
 description = "An iperf-style network throughput tester with a terminal UI: TCP, UDP and QUIC, real loss/jitter/retransmit measurements"
 readme = "README.md"
 keywords = ["network", "throughput", "benchmark", "iperf", "tui"]
