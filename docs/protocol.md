@@ -47,7 +47,7 @@ The protocol has an integer version, `PROTOCOL_VERSION` (currently **1**).
 | Version | gauge releases | Notes |
 |---|---|---|
 | 0 | 0.1.x | Not a number the peer sends: **a peer that sends no `protocol_version` is version 0**. |
-| 1 | 0.2.0 → | Adds `protocol_version` to the handshake and ack, the UDP receiver summary and the UDP per-stream server socket. |
+| 1 | 0.2.0 → (including all of 1.x) | Adds `protocol_version` to the handshake and ack, the UDP receiver summary and the UDP per-stream server socket. |
 
 **Rules**
 

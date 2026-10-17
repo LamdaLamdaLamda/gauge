@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.0] - 2026-10-17
+
+The first stable release. From here on the command line, the config file, the
+`history.json`/`-J` formats and the wire protocol follow the
+[stability policy](docs/stability.md): they change only in backward-compatible
+ways within 1.x. Nothing about measuring changed since 0.2.0 — this release
+makes the promise and closes the gaps found while preparing it.
+
 ### Added
 
 - `--tcp` and `--tx` (client) and `--tcp` (server): an explicit flag for every
@@ -152,6 +160,7 @@ First public version.
 - Supported platforms are Linux and macOS; the minimum supported Rust version
   is 1.88.
 
-[Unreleased]: https://github.com/LamdaLamdaLamda/gauge/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/LamdaLamdaLamda/gauge/compare/v1.0.0...HEAD
+[1.0.0]: https://github.com/LamdaLamdaLamda/gauge/compare/v0.2.0...v1.0.0
 [0.2.0]: https://github.com/LamdaLamdaLamda/gauge/compare/c2d8a60...v0.2.0
 [0.1.0]: https://github.com/LamdaLamdaLamda/gauge/commit/c2d8a60
